@@ -1,0 +1,10 @@
+{
+  "name": "@deepseek-agent/browser",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "vitest run src",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  }
+}

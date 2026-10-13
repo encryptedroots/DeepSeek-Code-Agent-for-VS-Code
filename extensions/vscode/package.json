@@ -1,0 +1,122 @@
+{
+  "name": "deepseek-code-agent-vscode",
+  "displayName": "DeepSeek Code Agent",
+  "description": "A reviewed, local coding agent using your authenticated DeepSeek web session.",
+  "version": "0.1.0",
+  "publisher": "deepseek-code-agent",
+  "engines": {
+    "vscode": "^1.97.0"
+  },
+  "categories": [
+    "Other",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onView:deepseekCodeAgent.chat"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "deepseekCodeAgent",
+          "title": "DeepSeek Agent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "deepseekCodeAgent": [
+        {
+          "id": "deepseekCodeAgent.chat",
+          "name": "Agent Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "deepseekCodeAgent.diagnoseBridge",
+        "title": "DeepSeek Agent: Diagnose Bridge"
+      },
+      {
+        "command": "deepseekCodeAgent.newSession",
+        "title": "DeepSeek Agent: New Session"
+      },
+      {
+        "command": "deepseekCodeAgent.clearConversation",
+        "title": "DeepSeek Agent: Clear Conversation"
+      }
+    ],
+    "configuration": {
+      "title": "DeepSeek Code Agent",
+      "properties": {
+        "deepseekCodeAgent.bridgePort": {
+          "type": "number",
+          "default": 43127,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Loopback port used by the paired browser extension."
+        },
+        "deepseekCodeAgent.maxIterations": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Maximum model/verification iterations per task."
+        },
+        "deepseekCodeAgent.maxResponseBytes": {
+          "type": "number",
+          "default": 150000,
+          "minimum": 10000,
+          "maximum": 200000,
+          "description": "Maximum accepted model response size."
+        },
+        "deepseekCodeAgent.commandTimeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 5,
+          "maximum": 900,
+          "description": "Maximum time allowed for an approved command."
+        },
+        "deepseekCodeAgent.contextLimitBytes": {
+          "type": "number",
+          "default": 80000,
+          "minimum": 10000,
+          "maximum": 300000,
+          "description": "Maximum source context sent to DeepSeek."
+        },
+        "deepseekCodeAgent.verificationCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Commands to propose as verification after agent changes; execution still requires approval unless trusted."
+        },
+        "deepseekCodeAgent.excludedGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional workspace file globs to exclude from context."
+        },
+        "deepseekCodeAgent.trustedCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Exact commands that may run without per-command approval; dangerous commands are still blocked."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "vitest run src",
+    "lint": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.webview.json",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository"
+  }
+}

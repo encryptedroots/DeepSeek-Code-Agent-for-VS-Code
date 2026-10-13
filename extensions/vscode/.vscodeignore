@@ -1,0 +1,10 @@
+.vscode/**
+src/**
+media/chat.ts
+build.mjs
+tsconfig*.json
+media/chat.css
+*.map
+dist/**/*.map
+node_modules/**
+**/*.test.ts

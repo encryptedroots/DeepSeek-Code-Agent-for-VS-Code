@@ -1,0 +1,32 @@
+{
+  "name": "deepseek-code-agent",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/protocol",
+    "extensions/vscode",
+    "extensions/browser"
+  ],
+  "scripts": {
+    "build": "npm run build -w @deepseek-agent/protocol && npm run build -w deepseek-code-agent-vscode && npm run build -w @deepseek-agent/browser",
+    "test": "npm run build -w @deepseek-agent/protocol && npm run test -w @deepseek-agent/protocol && npm run test -w deepseek-code-agent-vscode && npm run test -w @deepseek-agent/browser",
+    "lint": "npm run build -w @deepseek-agent/protocol && npm run lint -w @deepseek-agent/protocol && npm run lint -w deepseek-code-agent-vscode && npm run lint -w @deepseek-agent/browser && eslint .",
+    "format": "prettier --write \"**/*.{ts,js,mjs,json,css,html,md,yml,yaml}\"",
+    "format:check": "prettier --check .",
+    "package:browser": "npm run build -w @deepseek-agent/browser"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/chrome": "0.0.287",
+    "@types/node": "22.13.10",
+    "@types/vscode": "1.97.0",
+    "@vscode/vsce": "4.0.0",
+    "esbuild": "0.25.0",
+    "eslint": "10.12.0",
+    "globals": "16.0.0",
+    "prettier": "3.5.3",
+    "typescript": "5.8.2",
+    "typescript-eslint": "8.71.1",
+    "vitest": "4.1.11"
+  }
+}
