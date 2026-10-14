@@ -10,7 +10,7 @@ const safeRelativePath = z
       !value.includes("\\") &&
       !value.startsWith("/") &&
       !/^[a-zA-Z]:/.test(value) &&
-      value.split("/").every((part) => part !== ".." && part !== ""),
+      value.split("/").every((part) => part !== "." && part !== ".." && part !== ""),
     "Path must be a normalized relative path inside the workspace",
   );
 
@@ -114,7 +114,7 @@ export async function requestStructuredPlan(
         "The previous answer was rejected and nothing was executed.",
         `Validation error: ${error instanceof Error ? error.message : "invalid response"}`,
         "Return a complete replacement response as exactly one valid JSON object matching the established schema.",
-        "Field limits: plan is 1-4000 characters; summary is 1-30000 characters; each clarification is at most 1000 characters. Shorten only fields that exceed their limit.",
+        "Field limits: plan is 1-4000 characters; summary is 1-30000 characters; each clarification is at most 1000 characters; requestedFiles has at most 30 entries; searches has at most 20 entries. Shorten only fields that exceed their limit.",
         "Escape quotes, backslashes, and line breaks inside JSON strings. Do not use Markdown fences, commentary, or omit any required fields. Keep it within the response size limit.",
         "Do not repeat workspace context or propose a partial correction.",
       ].join("\n");
@@ -252,6 +252,7 @@ export function protocolInstructions(): string {
   return [
     "You are the reasoning engine for a local coding agent. Focus on the current task; use earlier chat only when clearly relevant. Inspect relevant context and conventions; make minimal coherent changes and preserve behavior. Plan privately, then return one JSON object only.",
     'Schema: {"version":1,"plan":"...","operations":[],"commands":[],"verification":[],"summary":"...","clarification":"optional question","requestedFiles":[],"searches":[]}.',
+    "Limits: at most 50 operations, 20 commands, 20 verification steps, 30 requestedFiles, and 20 searches. Each requested path must be a normalized workspace-relative path with no empty, '.' or '..' segments.",
     'Operations: {"type":"create","path":"relative/path","content":"complete file"}; {"type":"replace","path":"relative/path","edits":[{"search":"exact text","replace":"replacement","expectedOccurrences":1}]}; {"type":"delete","path":"relative/path"}.',
     "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches. Phrase it naturally as a direct conversational message without labels such as 'DeepSeek needs clarification'. If the user only greets or makes small talk, reply warmly and briefly, then invite them to say what they need.",
     "Do not ask the user for permission to inspect workspace files; workspace context is supplied for the requested task. For missing context, request specific files with requestedFiles and no operations.",

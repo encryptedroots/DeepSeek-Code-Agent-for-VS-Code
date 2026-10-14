@@ -1,8 +1,6 @@
 import * as vscode from "vscode";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { dirname, extname, join } from "node:path";
+import { extname } from "node:path";
 import {
   requestStructuredPlan,
   type AgentResponse,
@@ -21,9 +19,9 @@ import {
   shouldAskForCommandApproval,
   shouldAskForFileApproval,
   type ApprovalMode,
-  type ParsedCommand,
 } from "./commandSafety";
 import { TaskState, type TaskStatus } from "./state";
+import { runProcess, type CommandResult } from "./processRunner";
 import {
   buildClarificationFollowUpPrompt,
   buildTaskPrompt,
@@ -57,14 +55,6 @@ interface StagedChange {
   originalBytes?: Uint8Array;
   diskHash?: string;
   originalDocument?: vscode.TextDocument;
-}
-
-interface CommandResult {
-  command: string;
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-  timedOut: boolean;
 }
 
 interface SavedSession {
@@ -946,7 +936,7 @@ export class AgentController {
     );
     return runProcess(
       parsed,
-      this.workspace,
+      this.workspace.uri.fsPath,
       signal,
       vscode.workspace.getConfiguration("deepseekCodeAgent").get<number>("commandTimeoutSeconds", 120) * 1000,
     );
@@ -1009,70 +999,4 @@ function languageFor(path: string): string {
     html: "html",
   };
   return languages[extension] ?? "plaintext";
-}
-
-function runProcess(
-  parsed: ParsedCommand,
-  workspace: vscode.WorkspaceFolder,
-  signal: AbortSignal,
-  timeoutMs: number,
-): Promise<CommandResult> {
-  const invocation = resolveExecutable(parsed);
-  return new Promise((resolve, reject) => {
-    let child: ChildProcessWithoutNullStreams;
-    try {
-      child = spawn(invocation.executable, invocation.args, {
-        cwd: workspace.uri.fsPath,
-        shell: false,
-        windowsHide: true,
-      });
-    } catch (error) {
-      reject(
-        new Error(`Could not start ${parsed.executable}: ${error instanceof Error ? error.message : "process error"}`),
-      );
-      return;
-    }
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let settled = false;
-    const append = (current: string, chunk: Buffer): string => `${current}${chunk.toString("utf8")}`.slice(-30_000);
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout = append(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr = append(stderr, chunk);
-    });
-    const kill = () => child.kill();
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
-    const cleanup = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", kill);
-    };
-    signal.addEventListener("abort", kill, { once: true });
-    child.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error(`Could not execute ${parsed.executable}: ${error.message}`));
-    });
-    child.once("close", (exitCode) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve({ command: [parsed.executable, ...parsed.args].join(" "), exitCode, stdout, stderr, timedOut });
-    });
-  });
-}
-
-function resolveExecutable(command: ParsedCommand): { executable: string; args: string[] } {
-  if (process.platform === "win32" && /^(npm|npm\.cmd)$/i.test(command.executable)) {
-    const cli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-    if (!existsSync(cli)) throw new Error("Could not locate the installed npm CLI next to Node.js.");
-    return { executable: process.execPath, args: [cli, ...command.args] };
-  }
-  return { executable: command.executable, args: command.args };
 }

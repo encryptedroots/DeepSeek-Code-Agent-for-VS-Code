@@ -22,5 +22,10 @@ const valid = {
         (0, vitest_1.expect)(() => (0, index_1.parseAgentResponse)("{")).toThrow(/invalid or truncated JSON/);
         (0, vitest_1.expect)(() => (0, index_1.parseAgentResponse)(JSON.stringify({ ...valid, operations: [valid.operations[0], valid.operations[0]] }))).toThrow(/Duplicate/);
         (0, vitest_1.expect)(() => (0, index_1.parseAgentResponse)(JSON.stringify({ ...valid, operations: [{ ...valid.operations[0], path: "../outside" }] }))).toThrow(/relative path/);
+        (0, vitest_1.expect)(() => (0, index_1.parseAgentResponse)(JSON.stringify({ ...valid, operations: [{ ...valid.operations[0], path: "./src/new.ts" }] }))).toThrow(/relative path/);
+    });
+    (0, vitest_1.it)("documents protocol array bounds in the model instructions", () => {
+        (0, vitest_1.expect)((0, index_1.protocolInstructions)()).toContain("30 requestedFiles");
+        (0, vitest_1.expect)((0, index_1.protocolInstructions)()).toContain("20 searches");
     });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAgentResponse } from "./index";
+import { parseAgentResponse, protocolInstructions } from "./index";
 
 const valid = {
   version: 1,
@@ -30,5 +30,13 @@ describe("agent protocol", () => {
     expect(() =>
       parseAgentResponse(JSON.stringify({ ...valid, operations: [{ ...valid.operations[0], path: "../outside" }] })),
     ).toThrow(/relative path/);
+    expect(() =>
+      parseAgentResponse(JSON.stringify({ ...valid, operations: [{ ...valid.operations[0], path: "./src/new.ts" }] })),
+    ).toThrow(/relative path/);
+  });
+
+  it("documents protocol array bounds in the model instructions", () => {
+    expect(protocolInstructions()).toContain("30 requestedFiles");
+    expect(protocolInstructions()).toContain("20 searches");
   });
 });

@@ -4241,7 +4241,7 @@ var require_dist = __commonJS({
     exports2.parseAgentResponse = parseAgentResponse;
     exports2.protocolInstructions = protocolInstructions;
     var zod_1 = require_lib();
-    var safeRelativePath = zod_1.z.string().min(1).max(500).refine((value) => !value.includes("\0") && !value.includes("\\") && !value.startsWith("/") && !/^[a-zA-Z]:/.test(value) && value.split("/").every((part) => part !== ".." && part !== ""), "Path must be a normalized relative path inside the workspace");
+    var safeRelativePath = zod_1.z.string().min(1).max(500).refine((value) => !value.includes("\0") && !value.includes("\\") && !value.startsWith("/") && !/^[a-zA-Z]:/.test(value) && value.split("/").every((part) => part !== "." && part !== ".." && part !== ""), "Path must be a normalized relative path inside the workspace");
     var replacementSchema = zod_1.z.object({
       search: zod_1.z.string().min(1).max(1e5),
       replace: zod_1.z.string().max(1e5),
@@ -4306,7 +4306,7 @@ ${redactSensitiveText(context)}`
             "The previous answer was rejected and nothing was executed.",
             `Validation error: ${error instanceof Error ? error.message : "invalid response"}`,
             "Return a complete replacement response as exactly one valid JSON object matching the established schema.",
-            "Field limits: plan is 1-4000 characters; summary is 1-30000 characters; each clarification is at most 1000 characters. Shorten only fields that exceed their limit.",
+            "Field limits: plan is 1-4000 characters; summary is 1-30000 characters; each clarification is at most 1000 characters; requestedFiles has at most 30 entries; searches has at most 20 entries. Shorten only fields that exceed their limit.",
             "Escape quotes, backslashes, and line breaks inside JSON strings. Do not use Markdown fences, commentary, or omit any required fields. Keep it within the response size limit.",
             "Do not repeat workspace context or propose a partial correction."
           ].join("\n");
@@ -4402,6 +4402,7 @@ ${redactSensitiveText(context)}`
       return [
         "You are the reasoning engine for a local coding agent. Focus on the current task; use earlier chat only when clearly relevant. Inspect relevant context and conventions; make minimal coherent changes and preserve behavior. Plan privately, then return one JSON object only.",
         'Schema: {"version":1,"plan":"...","operations":[],"commands":[],"verification":[],"summary":"...","clarification":"optional question","requestedFiles":[],"searches":[]}.',
+        "Limits: at most 50 operations, 20 commands, 20 verification steps, 30 requestedFiles, and 20 searches. Each requested path must be a normalized workspace-relative path with no empty, '.' or '..' segments.",
         'Operations: {"type":"create","path":"relative/path","content":"complete file"}; {"type":"replace","path":"relative/path","edits":[{"search":"exact text","replace":"replacement","expectedOccurrences":1}]}; {"type":"delete","path":"relative/path"}.',
         "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches. Phrase it naturally as a direct conversational message without labels such as 'DeepSeek needs clarification'. If the user only greets or makes small talk, reply warmly and briefly, then invite them to say what they need.",
         "Do not ask the user for permission to inspect workspace files; workspace context is supplied for the requested task. For missing context, request specific files with requestedFiles and no operations.",
@@ -4424,10 +4425,8 @@ var vscode4 = __toESM(require("vscode"));
 
 // src/agent.ts
 var vscode2 = __toESM(require("vscode"));
-var import_node_child_process = require("node:child_process");
 var import_node_crypto2 = require("node:crypto");
-var import_node_fs = require("node:fs");
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 var import_protocol = __toESM(require_dist());
 
 // src/context.ts
@@ -5087,6 +5086,112 @@ var TaskState = class {
     this.current = next;
   }
 };
+
+// src/processRunner.ts
+var import_node_child_process = require("node:child_process");
+var import_node_fs = require("node:fs");
+var import_node_path = require("node:path");
+function runProcess(parsed, cwd, signal, timeoutMs) {
+  if (signal.aborted) return Promise.reject(new Error("Task cancelled."));
+  let invocation;
+  try {
+    invocation = resolveExecutable(parsed);
+  } catch (error) {
+    return Promise.reject(error instanceof Error ? error : new Error("Could not resolve the command executable."));
+  }
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = (0, import_node_child_process.spawn)(invocation.executable, invocation.args, {
+        cwd,
+        shell: false,
+        detached: process.platform !== "win32",
+        windowsHide: true
+      });
+    } catch (error) {
+      reject(
+        new Error(`Could not start ${parsed.executable}: ${error instanceof Error ? error.message : "process error"}`)
+      );
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    let terminationRequested = false;
+    let forceKillTimer;
+    const append = (current, chunk) => `${current}${chunk.toString("utf8")}`.slice(-3e4);
+    child.stdout.on("data", (chunk) => {
+      stdout = append(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = append(stderr, chunk);
+    });
+    const kill = () => {
+      if (terminationRequested) return;
+      terminationRequested = true;
+      const pid = child.pid;
+      if (!pid) {
+        child.kill();
+        return;
+      }
+      if (process.platform === "win32") {
+        const treeKiller = (0, import_node_child_process.spawn)("taskkill", ["/PID", String(pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true
+        });
+        treeKiller.once("error", () => child.kill());
+        treeKiller.once("close", (exitCode) => {
+          if (exitCode !== 0) child.kill();
+        });
+        return;
+      }
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        child.kill("SIGTERM");
+      }
+      forceKillTimer = setTimeout(() => {
+        try {
+          process.kill(-pid, 0);
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      }, 1e3);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", kill);
+      if (!terminationRequested && forceKillTimer) clearTimeout(forceKillTimer);
+    };
+    signal.addEventListener("abort", kill, { once: true });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error(`Could not execute ${parsed.executable}: ${error.message}`));
+    });
+    child.once("close", (exitCode) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ command: [parsed.executable, ...parsed.args].join(" "), exitCode, stdout, stderr, timedOut });
+    });
+  });
+}
+function resolveExecutable(command) {
+  if (process.platform === "win32" && /^(npm|npm\.cmd)$/i.test(command.executable)) {
+    const cli = (0, import_node_path.join)((0, import_node_path.dirname)(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+    if (!(0, import_node_fs.existsSync)(cli)) throw new Error("Could not locate the installed npm CLI next to Node.js.");
+    return { executable: process.execPath, args: [cli, ...command.args] };
+  }
+  return { executable: command.executable, args: command.args };
+}
 
 // src/taskPrompt.ts
 function buildTaskPrompt(userPrompt) {
@@ -5886,7 +5991,7 @@ ${command}`,
     );
     return runProcess(
       parsed,
-      this.workspace,
+      this.workspace.uri.fsPath,
       signal,
       vscode2.workspace.getConfiguration("deepseekCodeAgent").get("commandTimeoutSeconds", 120) * 1e3
     );
@@ -5928,7 +6033,7 @@ function parentUri(uri) {
   return uri.with({ path: uri.path.slice(0, uri.path.lastIndexOf("/")) });
 }
 function languageFor(path) {
-  const extension = (0, import_node_path.extname)(path).slice(1).toLowerCase();
+  const extension = (0, import_node_path2.extname)(path).slice(1).toLowerCase();
   const languages2 = {
     ts: "typescript",
     tsx: "typescriptreact",
@@ -5941,65 +6046,6 @@ function languageFor(path) {
     html: "html"
   };
   return languages2[extension] ?? "plaintext";
-}
-function runProcess(parsed, workspace5, signal, timeoutMs) {
-  const invocation = resolveExecutable(parsed);
-  return new Promise((resolve, reject) => {
-    let child;
-    try {
-      child = (0, import_node_child_process.spawn)(invocation.executable, invocation.args, {
-        cwd: workspace5.uri.fsPath,
-        shell: false,
-        windowsHide: true
-      });
-    } catch (error) {
-      reject(
-        new Error(`Could not start ${parsed.executable}: ${error instanceof Error ? error.message : "process error"}`)
-      );
-      return;
-    }
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let settled = false;
-    const append = (current, chunk) => `${current}${chunk.toString("utf8")}`.slice(-3e4);
-    child.stdout.on("data", (chunk) => {
-      stdout = append(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr = append(stderr, chunk);
-    });
-    const kill = () => child.kill();
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
-    const cleanup = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", kill);
-    };
-    signal.addEventListener("abort", kill, { once: true });
-    child.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error(`Could not execute ${parsed.executable}: ${error.message}`));
-    });
-    child.once("close", (exitCode) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve({ command: [parsed.executable, ...parsed.args].join(" "), exitCode, stdout, stderr, timedOut });
-    });
-  });
-}
-function resolveExecutable(command) {
-  if (process.platform === "win32" && /^(npm|npm\.cmd)$/i.test(command.executable)) {
-    const cli = (0, import_node_path.join)((0, import_node_path.dirname)(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-    if (!(0, import_node_fs.existsSync)(cli)) throw new Error("Could not locate the installed npm CLI next to Node.js.");
-    return { executable: process.execPath, args: [cli, ...command.args] };
-  }
-  return { executable: command.executable, args: command.args };
 }
 
 // src/bridgeServer.ts
