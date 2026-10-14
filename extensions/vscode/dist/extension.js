@@ -4235,8 +4235,9 @@ var require_dist = __commonJS({
   "../../packages/protocol/dist/index.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.bridgeProgressSchema = exports2.bridgeResultSchema = exports2.bridgeJobSchema = exports2.agentResponseSchema = void 0;
+    exports2.bridgeActivitySchema = exports2.bridgeProgressSchema = exports2.bridgeResultSchema = exports2.bridgeJobSchema = exports2.DEFAULT_DEEPSEEK_CHAT_URL = exports2.agentResponseSchema = void 0;
     exports2.requestStructuredPlan = requestStructuredPlan2;
+    exports2.validateDeepSeekChatUrl = validateDeepSeekChatUrl3;
     exports2.parseAgentResponse = parseAgentResponse;
     exports2.protocolInstructions = protocolInstructions;
     var zod_1 = require_lib();
@@ -4286,7 +4287,7 @@ ${redactSensitiveText(context)}`
       let requestPrompt = instruction;
       let lastError;
       for (let attempt = 0; attempt <= MAX_RESPONSE_REPAIRS; attempt += 1) {
-        const response = await provider.request(requestPrompt, responseLimit, signal, onProgress);
+        const response = await provider.request(requestPrompt, responseLimit, signal, onProgress, options.onActivity);
         try {
           if (new TextEncoder().encode(response).byteLength > responseLimit)
             throw new Error("DeepSeek response exceeded the configured size limit.");
@@ -4309,19 +4310,46 @@ ${redactSensitiveText(context)}`
     function redactSensitiveText(text) {
       return text.replace(/-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END .*?PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]").replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})\b/g, "[REDACTED SECRET]").replace(/https?:\/\/[^/\s:@]+:[^@\s/]+@/gi, "https://[REDACTED]@").replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]").replace(/(["']?[\w.-]*(?:api[_-]?key|access[_-]?token|secret|password|passwd|private[_-]?key|authorization)[\w.-]*["']?\s*[:=]\s*["']?)[^"',\s}\r\n]+/gi, "$1[REDACTED]");
     }
+    exports2.DEFAULT_DEEPSEEK_CHAT_URL = "https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c";
+    function validateDeepSeekChatUrl3(input) {
+      let url;
+      try {
+        url = new URL(input.trim());
+      } catch {
+        throw new Error("Enter a valid DeepSeek conversation URL.");
+      }
+      if (url.protocol !== "https:" || url.hostname !== "chat.deepseek.com" || url.origin !== "https://chat.deepseek.com" || url.username || url.password || url.search || url.hash || !/^\/a\/chat\/s\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i.test(url.pathname)) {
+        throw new Error("Use an HTTPS conversation URL from chat.deepseek.com with a valid chat ID.");
+      }
+      return `https://chat.deepseek.com${url.pathname.replace(/\/$/, "")}`;
+    }
+    var deepSeekChatUrlSchema = zod_1.z.string().max(2048).refine((value) => {
+      try {
+        return validateDeepSeekChatUrl3(value) === value;
+      } catch {
+        return false;
+      }
+    }, "Use a valid HTTPS chat.deepseek.com conversation URL.");
     exports2.bridgeJobSchema = zod_1.z.object({
       id: zod_1.z.string().uuid(),
       prompt: zod_1.z.string().min(1).max(4e5),
-      responseLimit: zod_1.z.number().int().positive().max(2e5)
+      responseLimit: zod_1.z.number().int().positive().max(2e5),
+      chatUrl: deepSeekChatUrlSchema,
+      newConversation: zod_1.z.boolean().optional()
     }).strict();
     exports2.bridgeResultSchema = zod_1.z.object({
       id: zod_1.z.string().uuid(),
       response: zod_1.z.string().min(1).max(2e5).optional(),
-      error: zod_1.z.string().max(2e3).optional()
+      error: zod_1.z.string().max(2e3).optional(),
+      conversationUrl: deepSeekChatUrlSchema.optional()
     }).strict().refine((result) => Boolean(result.response) !== Boolean(result.error), "Provide either a response or an error");
     exports2.bridgeProgressSchema = zod_1.z.object({
       id: zod_1.z.string().uuid(),
       text: zod_1.z.string().max(2e5)
+    }).strict();
+    exports2.bridgeActivitySchema = zod_1.z.object({
+      id: zod_1.z.string().uuid(),
+      activity: zod_1.z.enum(["thinking", "answering"])
     }).strict();
     function parseAgentResponse(input) {
       const trimmed = input.trim();
@@ -4369,7 +4397,7 @@ ${redactSensitiveText(context)}`
         "You are the reasoning engine for a local coding agent. Focus on the current task; use earlier chat only when clearly relevant. Inspect relevant context and conventions; make minimal coherent changes and preserve behavior. Plan privately, then return one JSON object only.",
         'Schema: {"version":1,"plan":"...","operations":[],"commands":[],"verification":[],"summary":"...","clarification":"optional question","requestedFiles":[],"searches":[]}.',
         'Operations: {"type":"create","path":"relative/path","content":"complete file"}; {"type":"replace","path":"relative/path","edits":[{"search":"exact text","replace":"replacement","expectedOccurrences":1}]}; {"type":"delete","path":"relative/path"}.',
-        "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches.",
+        "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches. Phrase it naturally as a direct conversational message without labels such as 'DeepSeek needs clarification'. If the user only greets or makes small talk, reply warmly and briefly, then invite them to say what they need.",
         "Follow the supplied schema exactly. Escape all quotes, backslashes, and newlines inside JSON strings. Do not infer successful verification; use observed command results only."
       ].join("\n");
     }
@@ -4384,6 +4412,7 @@ __export(extension_exports, {
 });
 module.exports = __toCommonJS(extension_exports);
 var vscode4 = __toESM(require("vscode"));
+var import_protocol4 = __toESM(require_dist());
 
 // src/agent.ts
 var vscode2 = __toESM(require("vscode"));
@@ -4771,6 +4800,14 @@ function parseSafeCommand(command) {
 function isTrustedCommand(command, trusted) {
   return trusted.some((entry) => entry.trim() === command.trim());
 }
+function shouldAskForCommandApproval(command, trusted, mode) {
+  if (mode === "review") return true;
+  if (mode === "auto-all") return false;
+  return !isTrustedCommand(command, trusted);
+}
+function shouldAskForFileApproval(mode, containsDeletion) {
+  return mode === "review" || mode === "safe-auto" && containsDeletion;
+}
 
 // src/state.ts
 var TaskState = class {
@@ -4834,7 +4871,7 @@ var AgentController = class {
     this.ui.append("assistant", message);
     await this.persist("assistant", message);
   }
-  async start(userPrompt) {
+  async start(userPrompt, approvalMode = "review") {
     if (this.abortController) {
       this.ui.status(this.status, "A task is already running. Cancel it before starting another.");
       return;
@@ -4859,7 +4896,7 @@ var AgentController = class {
       this.transition("thinking", "Collecting relevant workspace context\u2026");
       if (!vscode2.workspace.isTrusted)
         throw new Error("Mark this workspace as trusted in VS Code before using the coding agent.");
-      await this.runTask(prompt, this.abortController.signal);
+      await this.runTask(prompt, this.abortController.signal, approvalMode);
     } catch (error) {
       const message = error instanceof Error ? error.message : "The task failed unexpectedly.";
       if (this.abortController.signal.aborted || message.startsWith("Task cancelled")) {
@@ -4946,7 +4983,7 @@ var AgentController = class {
     this.viewingPastSession = true;
     this.ui.postHistory(saved.id, saved.messages);
   }
-  async runTask(userPrompt, signal) {
+  async runTask(userPrompt, signal, approvalMode) {
     const configuration = vscode2.workspace.getConfiguration("deepseekCodeAgent");
     const maxIterations = configuration.get("maxIterations", 5);
     const responseLimit = configuration.get("maxResponseBytes", 15e4);
@@ -5003,9 +5040,13 @@ ${newSearches.join("\n\n")}${missingContext}`,
         responseLimit,
         signal,
         void 0,
-        { includeProtocol: iteration === 1 }
+        {
+          includeProtocol: iteration === 1,
+          onActivity: (activity) => this.ui.activity?.(activity)
+        }
       );
       this.throwIfCancelled(signal);
+      this.ui.approach?.(response.plan);
       this.transition("thinking", "Preparing changes\u2026");
       const signature = (0, import_node_crypto2.createHash)("sha256").update(JSON.stringify(response)).digest("hex");
       if (responseSignatures.has(signature) && verificationMessages.length) {
@@ -5016,9 +5057,9 @@ ${newSearches.join("\n\n")}${missingContext}`,
         if (response.operations.length || response.commands.length || response.requestedFiles?.length || response.searches?.length)
           throw new Error("A clarification response cannot also request context or propose changes.");
         this.transition("clarification", "Waiting for your clarification");
-        const question = `DeepSeek needs clarification: ${response.clarification}`;
-        this.ui.append("assistant", question);
-        await this.persist("assistant", question);
+        const reply = response.clarification.trim();
+        this.ui.append("assistant", reply);
+        await this.persist("assistant", reply);
         return;
       }
       if (response.requestedFiles?.length || response.searches?.length) {
@@ -5047,27 +5088,40 @@ ${matches.join("\n") || "No new matches found."}`);
         response.verification
       );
       if (staged.length) {
-        this.transition("waiting", `Waiting for approval \xB7 ${staged.length} proposed file change(s)`);
-        const approved = await this.previewAndApprove(staged, response.plan);
-        this.throwIfCancelled(signal);
-        if (!approved) throw new Error("Task cancelled by user before applying the proposed changes.");
-        this.transition("editing", `Applying ${staged.length} approved file change(s)\u2026`);
-        await this.applyChanges(staged, signal);
+        const containsDeletion = staged.some((change) => change.operation.type === "delete");
+        const requiresDiffReview = shouldAskForFileApproval(approvalMode, containsDeletion);
+        if (requiresDiffReview) {
+          this.transition(
+            "waiting",
+            containsDeletion ? "Waiting for approval \xB7 file changes include deletion(s)" : `Waiting for approval \xB7 ${staged.length} proposed file change(s)`
+          );
+          const approved = await this.previewAndApprove(staged, response.plan, approvalMode === "review", signal);
+          this.throwIfCancelled(signal);
+          if (!approved) throw new Error("Task cancelled by user before applying the proposed changes.");
+        }
+        this.transition(
+          "editing",
+          `Applying ${staged.length} ${approvalMode === "review" ? "approved " : ""}file change(s)\u2026`
+        );
+        await this.applyChanges(staged, signal, approvalMode);
         recentChanges.push(...staged.map((change) => `${change.operation.type} ${change.operation.path}`));
         await this.extensionContext.workspaceState.update("recentAgentChanges", recentChanges.slice(-40));
       }
       const commandResults = [];
       for (const command of commandsToRun) {
         this.throwIfCancelled(signal);
-        this.transition("waiting", `Waiting for approval \xB7 ${command}`);
-        const result = await this.approveAndRun(command, signal);
+        const trusted = configuration.get("trustedCommands", []);
+        if (shouldAskForCommandApproval(command, trusted, approvalMode))
+          this.transition("waiting", `Waiting for approval \xB7 ${command}`);
+        const result = await this.approveAndRun(command, signal, approvalMode);
         if (!result) throw new Error("Task cancelled before running a proposed command.");
         commandResults.push(result);
       }
       if (!commandResults.length) {
+        const changeResult = staged.length ? approvalMode !== "review" ? `Applied ${staged.length} file change(s) in ${approvalMode === "auto-all" ? "auto-apply everything" : "safe auto"} mode.` : `Applied ${staged.length} approved file change(s).` : "No files were changed.";
         const message = `Intended summary: ${response.summary}
 
-${staged.length ? `Applied ${staged.length} approved file change(s).` : "No files were changed."}
+${changeResult}
 Verification was not performed.${response.verification.length ? `
 Proposed checks were not run: ${response.verification.join("; ")}` : ""}`;
         this.transition("completed", "Completed \xB7 verification not performed");
@@ -5083,9 +5137,10 @@ ${result.stdout}
 ${result.stderr}`.trim()
       );
       if (!failed.length) {
+        const changeResult = staged.length ? approvalMode !== "review" ? `Applied ${staged.length} file change(s) in ${approvalMode === "auto-all" ? "auto-apply everything" : "safe auto"} mode.` : `Applied ${staged.length} approved file change(s).` : "No files were changed.";
         const message = `Intended summary: ${response.summary}
 
-${staged.length ? `Applied ${staged.length} approved file change(s).` : "No files were changed."}
+${changeResult}
 Verification passed:
 ${commandResults.map((item) => `- ${item.command} (exit ${item.exitCode})
 ${item.stdout.slice(-1e3)}${item.stderr ? `
@@ -5174,7 +5229,7 @@ ${result.stderr}`).digest("hex");
     }
     return staged;
   }
-  async previewAndApprove(staged, plan) {
+  async previewAndApprove(staged, plan, requireApproval = true, signal) {
     for (const change of staged) {
       const original = change.originalDocument ?? (change.diskHash ? await vscode2.workspace.openTextDocument(change.uri) : await vscode2.workspace.openTextDocument({ content: "", language: languageFor(change.operation.path) }));
       const content = normalizeEol(change.after, original.eol);
@@ -5189,24 +5244,29 @@ ${result.stderr}`).digest("hex");
         `${change.operation.type}: ${change.operation.path}`
       );
     }
-    return vscode2.window.showWarningMessage(
+    if (!requireApproval) return true;
+    if (!signal) throw new Error("An abort signal is required for file approval.");
+    return await this.ui.requestApproval?.(
+      "Review proposed file changes",
       `${plan}
 
-Review the open diffs. Apply the ${staged.length} proposed file change(s)?`,
-      { modal: true },
-      "Apply changes"
-    ).then((answer) => answer === "Apply changes");
+Review the open diffs. Apply ${staged.length} proposed file change(s)?`,
+      "Apply changes",
+      signal
+    ) ?? false;
   }
-  async applyChanges(staged, signal) {
+  async applyChanges(staged, signal, approvalMode) {
     for (const change of staged) {
-      if (change.operation.type === "delete") {
+      if (change.operation.type === "delete" && approvalMode !== "auto-all") {
         this.transition("waiting", `Waiting for deletion approval \xB7 ${change.operation.path}`);
-        const answer = await vscode2.window.showWarningMessage(
+        const approved = await this.ui.requestApproval?.(
+          "Confirm file deletion",
           `Delete ${change.operation.path}? A backup will be kept in extension storage.`,
-          { modal: true },
-          "Delete file"
-        );
-        if (answer !== "Delete file")
+          "Delete file",
+          signal
+        ) ?? false;
+        this.throwIfCancelled(signal);
+        if (!approved)
           throw new Error(`Task cancelled by user: deletion was not approved for ${change.operation.path}.`);
         this.transition("editing", `Deleting approved file \xB7 ${change.operation.path}`);
       }
@@ -5267,21 +5327,25 @@ Review the open diffs. Apply the ${staged.length} proposed file change(s)?`,
       change.originalBytes ?? new TextEncoder().encode(change.before)
     );
   }
-  async approveAndRun(command, signal) {
+  async approveAndRun(command, signal, approvalMode) {
     const parsed = parseSafeCommand(command);
     const trusted = vscode2.workspace.getConfiguration("deepseekCodeAgent").get("trustedCommands", []);
-    if (!isTrustedCommand(command, trusted)) {
-      const answer = await vscode2.window.showWarningMessage(
+    if (shouldAskForCommandApproval(command, trusted, approvalMode)) {
+      const approved = await this.ui.requestApproval?.(
+        "Run proposed command?",
         `Run this exact command in the workspace?
 
 ${command}`,
-        { modal: true },
-        "Run command"
-      );
+        "Run command",
+        signal
+      ) ?? false;
       this.throwIfCancelled(signal);
-      if (answer !== "Run command") return void 0;
+      if (!approved) return void 0;
     }
-    this.transition("testing", `Running approved command: ${command}`);
+    this.transition(
+      "testing",
+      `Running ${approvalMode === "auto-all" ? "automatically approved" : "approved"} command: ${command}`
+    );
     return runProcess(
       parsed,
       this.workspace,
@@ -5405,19 +5469,28 @@ var import_node_crypto3 = require("node:crypto");
 var import_node_http = require("node:http");
 var import_protocol2 = __toESM(require_dist());
 var BridgeServer = class {
-  constructor(port) {
+  constructor(port, getChatUrl = () => import_protocol2.DEFAULT_DEEPSEEK_CHAT_URL, pairedToken, onConversationUrl) {
     this.port = port;
+    this.getChatUrl = getChatUrl;
+    this.onConversationUrl = onConversationUrl;
+    this.token = pairedToken ?? (0, import_node_crypto3.randomBytes)(32).toString("hex");
+    this.paired = pairedToken !== void 0;
+    this.pairingCode = pairedToken === void 0 ? String((0, import_node_crypto3.randomInt)(1e7, 1e8)) : "";
   }
   server;
-  token = (0, import_node_crypto3.randomBytes)(32).toString("hex");
-  pairingCode = String((0, import_node_crypto3.randomInt)(1e7, 1e8));
+  token;
+  pairingCode;
   pairingAttempts = 0;
-  paired = false;
+  paired;
   lastBrowserPoll = 0;
   pairListeners = /* @__PURE__ */ new Set();
   queue = [];
+  newConversationQueue = [];
+  pendingNewConversations = /* @__PURE__ */ new Map();
+  newConversationForNextTask = false;
   pending = /* @__PURE__ */ new Map();
   progress = /* @__PURE__ */ new Map();
+  activities = /* @__PURE__ */ new Map();
   cancelled = /* @__PURE__ */ new Set();
   get code() {
     return this.pairingCode;
@@ -5429,6 +5502,9 @@ var BridgeServer = class {
   }
   get isPaired() {
     return this.paired;
+  }
+  get reconnectToken() {
+    return this.paired ? this.token : void 0;
   }
   get browserActive() {
     return this.paired && Date.now() - this.lastBrowserPoll < 9e4;
@@ -5462,13 +5538,19 @@ var BridgeServer = class {
   async stop() {
     for (const request of this.pending.values()) request.reject(new Error("The browser bridge was stopped."));
     this.pending.clear();
+    for (const pending of this.pendingNewConversations.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("The browser bridge was stopped."));
+    }
+    this.pendingNewConversations.clear();
     this.progress.clear();
+    this.activities.clear();
     this.queue.length = 0;
     if (!this.server) return;
     await new Promise((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve()));
     this.server = void 0;
   }
-  request(prompt, responseLimit, signal, onProgress) {
+  request(prompt, responseLimit, signal, onProgress, onActivity) {
     if (Buffer.byteLength(prompt, "utf8") > 4e5)
       return Promise.reject(new Error("Prompt exceeds the 400 KB browser-bridge limit."));
     if (!Number.isInteger(responseLimit) || responseLimit < 1 || responseLimit > 2e5) {
@@ -5481,7 +5563,21 @@ var BridgeServer = class {
         )
       );
     if (signal.aborted) return Promise.reject(new Error("Task cancelled."));
-    const job = import_protocol2.bridgeJobSchema.safeParse({ id: (0, import_node_crypto3.randomUUID)(), prompt, responseLimit });
+    let chatUrl;
+    try {
+      chatUrl = (0, import_protocol2.validateDeepSeekChatUrl)(this.getChatUrl());
+    } catch (error) {
+      return Promise.reject(
+        error instanceof Error ? error : new Error("Configured DeepSeek conversation URL is invalid.")
+      );
+    }
+    const job = import_protocol2.bridgeJobSchema.safeParse({
+      id: (0, import_node_crypto3.randomUUID)(),
+      prompt,
+      responseLimit,
+      chatUrl,
+      newConversation: this.newConversationForNextTask
+    });
     if (!job.success) return Promise.reject(new Error("Bridge request did not match the supported protocol."));
     const id = job.data.id;
     return new Promise((resolve, reject) => {
@@ -5493,6 +5589,7 @@ var BridgeServer = class {
         if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
         else this.markCancelled(id);
         this.progress.delete(id);
+        this.activities.delete(id);
         reject(new Error("Task cancelled."));
       };
       signal.addEventListener("abort", onAbort, { once: true });
@@ -5508,9 +5605,11 @@ var BridgeServer = class {
       };
       this.pending.set(id, { resolve: cleanupResolve, reject: cleanupReject });
       if (onProgress) this.progress.set(id, { onProgress, limit: responseLimit, lastText: "" });
+      if (onActivity) this.activities.set(id, onActivity);
       timers.request = setTimeout(() => {
         this.pending.delete(id);
         this.progress.delete(id);
+        this.activities.delete(id);
         const queuedIndex = this.queue.findIndex((job2) => job2.id === id);
         if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
         else this.markCancelled(id);
@@ -5547,12 +5646,18 @@ var BridgeServer = class {
       }
       this.paired = true;
       this.pairingCode = "";
-      for (const listener of this.pairListeners) listener();
+      for (const listener of this.pairListeners) listener(this.token);
       this.send(response, 200, { token: this.token });
       return;
     }
     if (pathname === "/health" && request.method === "GET") {
-      this.send(response, 200, { ok: true, paired: this.paired, browserActive: this.browserActive });
+      let chatUrl;
+      try {
+        chatUrl = (0, import_protocol2.validateDeepSeekChatUrl)(this.getChatUrl());
+      } catch {
+        chatUrl = void 0;
+      }
+      this.send(response, 200, { ok: true, paired: this.paired, browserActive: this.browserActive, chatUrl });
       return;
     }
     if (!this.authorized(request)) {
@@ -5561,6 +5666,11 @@ var BridgeServer = class {
     }
     if (pathname === "/next" && request.method === "GET") {
       this.lastBrowserPoll = Date.now();
+      const newConversationId = this.newConversationQueue.shift();
+      if (newConversationId) {
+        this.send(response, 200, { type: "new-conversation", id: newConversationId });
+        return;
+      }
       const job = this.queue.shift();
       if (!job) {
         response.writeHead(204);
@@ -5590,11 +5700,84 @@ var BridgeServer = class {
         this.send(response, 404, { error: "Request expired or was cancelled." });
         return;
       }
+      if (parsed.data.conversationUrl) {
+        try {
+          await this.onConversationUrl?.(parsed.data.conversationUrl);
+          this.newConversationForNextTask = false;
+        } catch (error) {
+          this.pending.delete(parsed.data.id);
+          this.progress.delete(parsed.data.id);
+          this.activities.delete(parsed.data.id);
+          pending.reject(
+            new Error(
+              `DeepSeek created a new conversation, but VS Code could not save its URL: ${error instanceof Error ? error.message : "settings update failed"}`
+            )
+          );
+          this.send(response, 200, { ok: true });
+          return;
+        }
+      }
       this.pending.delete(parsed.data.id);
       this.progress.delete(parsed.data.id);
+      this.activities.delete(parsed.data.id);
       if (parsed.data.error) pending.reject(new Error(parsed.data.error));
       else if (parsed.data.response) pending.resolve(parsed.data.response);
       else pending.reject(new Error("Browser returned an empty response."));
+      this.send(response, 200, { ok: true });
+      return;
+    }
+    if (pathname === "/new-conversation/complete" && request.method === "POST") {
+      const body = await this.readBody(request, response);
+      if (body === void 0) return;
+      let input;
+      try {
+        input = JSON.parse(body);
+      } catch {
+        this.send(response, 400, { error: "Invalid new-conversation result." });
+        return;
+      }
+      if (typeof input !== "object" || input === null || !("id" in input) || typeof input.id !== "string" || !("ok" in input) || typeof input.ok !== "boolean" || "error" in input && (typeof input.error !== "string" || input.error.length > 2e3)) {
+        this.send(response, 400, { error: "Browser returned an invalid new-conversation result." });
+        return;
+      }
+      const pending = this.pendingNewConversations.get(input.id);
+      if (!pending) {
+        this.send(response, 404, { error: "New-conversation request expired." });
+        return;
+      }
+      this.pendingNewConversations.delete(input.id);
+      clearTimeout(pending.timer);
+      if (input.ok) {
+        this.newConversationForNextTask = true;
+        pending.resolve();
+      } else {
+        const message = "error" in input && typeof input.error === "string" ? input.error : void 0;
+        pending.reject(new Error(message || "Could not open a new DeepSeek conversation."));
+      }
+      this.send(response, 200, { ok: true });
+      return;
+    }
+    if (pathname === "/activity" && request.method === "POST") {
+      const body = await this.readBody(request, response);
+      if (body === void 0) return;
+      let input;
+      try {
+        input = JSON.parse(body);
+      } catch {
+        this.send(response, 400, { error: "Invalid activity body." });
+        return;
+      }
+      const parsed = import_protocol2.bridgeActivitySchema.safeParse(input);
+      if (!parsed.success) {
+        this.send(response, 400, { error: "Browser returned invalid activity." });
+        return;
+      }
+      const onActivity = this.activities.get(parsed.data.id);
+      if (!this.pending.has(parsed.data.id) || !onActivity) {
+        this.send(response, 404, { error: "Request expired." });
+        return;
+      }
+      onActivity(parsed.data.activity);
       this.send(response, 200, { ok: true });
       return;
     }
@@ -5635,6 +5818,23 @@ var BridgeServer = class {
     }
     this.send(response, 404, { error: "Unknown bridge endpoint." });
   }
+  startNewConversation() {
+    if (!this.paired)
+      return Promise.reject(new Error("Pair the browser extension before opening a new DeepSeek conversation."));
+    if (this.newConversationForNextTask || this.pendingNewConversations.size)
+      return Promise.reject(new Error("A new DeepSeek conversation is already being prepared."));
+    const id = (0, import_node_crypto3.randomUUID)();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingNewConversations.delete(id);
+        const queuedIndex = this.newConversationQueue.indexOf(id);
+        if (queuedIndex >= 0) this.newConversationQueue.splice(queuedIndex, 1);
+        reject(new Error("Timed out waiting for the browser to open a new DeepSeek conversation."));
+      }, 3e4);
+      this.pendingNewConversations.set(id, { resolve, reject, timer });
+      this.newConversationQueue.push(id);
+    });
+  }
   authorized(request) {
     const authorization = request.headers.authorization ?? "";
     if (!authorization.startsWith("Bearer ")) return false;
@@ -5672,6 +5872,8 @@ var BridgeServer = class {
 
 // src/view.ts
 var vscode3 = __toESM(require("vscode"));
+var import_node_crypto4 = require("node:crypto");
+var import_protocol3 = __toESM(require_dist());
 var AgentViewProvider = class {
   constructor(extensionUri, context, bridge2) {
     this.extensionUri = extensionUri;
@@ -5682,6 +5884,7 @@ var AgentViewProvider = class {
   controller;
   restored = false;
   disposables = [];
+  pendingApprovals = /* @__PURE__ */ new Map();
   attach(controller) {
     this.controller = controller;
   }
@@ -5693,39 +5896,77 @@ var AgentViewProvider = class {
     };
     view2.webview.html = this.html(view2.webview);
     this.disposables.push(
-      view2.webview.onDidReceiveMessage((message) => {
-        if (message.type === "ready") {
-          this.post({
-            type: "initialize",
-            workspace: vscode3.workspace.workspaceFolders?.[0]?.name ?? "No workspace",
-            status: this.controller?.status ?? "completed",
-            pairingCode: this.bridge.isPaired ? void 0 : this.bridge.code,
-            bridgePaired: this.bridge.isPaired,
-            browserActive: this.bridge.browserActive,
-            port: vscode3.workspace.getConfiguration("deepseekCodeAgent").get("bridgePort", 43127)
-          });
-          if (!this.restored && this.controller) {
-            this.restored = true;
-            void this.controller.restoreHistory();
+      view2.webview.onDidReceiveMessage(
+        (message) => {
+          if (message.type === "ready") {
+            this.post({
+              type: "initialize",
+              workspace: vscode3.workspace.workspaceFolders?.[0]?.name ?? "No workspace",
+              status: this.controller?.status ?? "completed",
+              pairingCode: this.bridge.isPaired ? void 0 : this.bridge.code,
+              bridgePaired: this.bridge.isPaired,
+              browserActive: this.bridge.browserActive,
+              port: vscode3.workspace.getConfiguration("deepseekCodeAgent").get("bridgePort", 43127),
+              conversationUrl: vscode3.workspace.getConfiguration("deepseekCodeAgent").get("conversationUrl", import_protocol3.DEFAULT_DEEPSEEK_CHAT_URL),
+              autoConnect: vscode3.workspace.getConfiguration("deepseekCodeAgent").get("autoConnect", true)
+            });
+            if (!this.restored && this.controller) {
+              this.restored = true;
+              void this.controller.restoreHistory();
+            }
+          } else if (message.type === "send" && typeof message.text === "string") {
+            if (!this.controller) {
+              this.status("failed", "Agent is not ready.");
+              return;
+            }
+            void this.controller.start(
+              message.text,
+              message.approvalMode === "safe-auto" || message.approvalMode === "auto-all" ? message.approvalMode : "review"
+            );
+          } else if (message.type === "cancel") {
+            this.controller?.cancel();
+          } else if (message.type === "clear") {
+            void this.controller?.clearHistory();
+          } else if (message.type === "new-session") {
+            void this.startNewSession();
+          } else if (message.type === "open-session" && typeof message.text === "string") {
+            void this.controller?.openSession(message.text);
+          } else if (message.type === "approval-response" && typeof message.approvalId === "string") {
+            this.finishApproval(message.approvalId, message.approved === true);
+          } else if (message.type === "save-conversation-url" && typeof message.text === "string") {
+            try {
+              const url = (0, import_protocol3.validateDeepSeekChatUrl)(message.text);
+              void vscode3.workspace.getConfiguration("deepseekCodeAgent").update("conversationUrl", url, vscode3.ConfigurationTarget.Global).then(
+                () => this.post({ type: "conversation-url-saved", url, ok: true }),
+                (error) => this.post({
+                  type: "conversation-url-saved",
+                  ok: false,
+                  message: error instanceof Error ? error.message : "Could not save the conversation URL."
+                })
+              );
+            } catch (error) {
+              this.post({
+                type: "conversation-url-saved",
+                ok: false,
+                message: error instanceof Error ? error.message : "Use a valid DeepSeek conversation URL."
+              });
+            }
+          } else if (message.type === "save-auto-connect" && typeof message.enabled === "boolean") {
+            void vscode3.workspace.getConfiguration("deepseekCodeAgent").update("autoConnect", message.enabled, vscode3.ConfigurationTarget.Global).then(
+              () => this.post({ type: "auto-connect-saved", enabled: message.enabled, ok: true }),
+              (error) => this.post({
+                type: "auto-connect-saved",
+                enabled: message.enabled,
+                ok: false,
+                message: error instanceof Error ? error.message : "Could not save the connection preference."
+              })
+            );
           }
-        } else if (message.type === "send" && typeof message.text === "string") {
-          if (!this.controller) {
-            this.status("failed", "Agent is not ready.");
-            return;
-          }
-          void this.controller.start(message.text);
-        } else if (message.type === "cancel") {
-          this.controller?.cancel();
-        } else if (message.type === "clear") {
-          void this.controller?.clearHistory();
-        } else if (message.type === "new-session") {
-          void this.controller?.newSession();
-        } else if (message.type === "open-session" && typeof message.text === "string") {
-          void this.controller?.openSession(message.text);
         }
-      })
+      )
     );
     view2.onDidDispose(() => {
+      for (const id of this.pendingApprovals.keys()) this.finishApproval(id, false);
       this.view = void 0;
     });
   }
@@ -5740,6 +5981,22 @@ var AgentViewProvider = class {
   }
   stream(text) {
     this.post({ type: "stream", text });
+  }
+  activity(activity) {
+    this.post({ type: "activity", activity });
+  }
+  approach(summary) {
+    this.post({ type: "approach", summary });
+  }
+  requestApproval(title, detail, approveLabel, signal) {
+    if (signal.aborted || !this.view) return Promise.resolve(false);
+    const id = (0, import_node_crypto4.randomUUID)();
+    return new Promise((resolve) => {
+      const abortHandler = () => this.finishApproval(id, false);
+      this.pendingApprovals.set(id, { resolve, signal, abortHandler });
+      signal.addEventListener("abort", abortHandler, { once: true });
+      this.post({ type: "approval-prompt", id, title, detail, approveLabel });
+    });
   }
   clear() {
     this.post({ type: "clear" });
@@ -5757,7 +6014,10 @@ var AgentViewProvider = class {
     void this.controller?.clearHistory();
   }
   newSession() {
-    void this.controller?.newSession();
+    void this.startNewSession();
+  }
+  conversationUrlUpdated(url) {
+    this.post({ type: "conversation-url-updated", url });
   }
   dispose() {
     vscode3.Disposable.from(...this.disposables).dispose();
@@ -5765,28 +6025,71 @@ var AgentViewProvider = class {
   post(message) {
     void this.view?.webview.postMessage(message);
   }
+  finishApproval(id, approved) {
+    const pending = this.pendingApprovals.get(id);
+    if (!pending) return;
+    this.pendingApprovals.delete(id);
+    pending.signal.removeEventListener("abort", pending.abortHandler);
+    pending.resolve(approved);
+    this.post({ type: "approval-clear", id });
+  }
+  async startNewSession() {
+    if (!this.controller || this.controller.isRunning) {
+      this.status(this.controller?.status ?? "failed", "Cancel the active task before starting a new conversation.");
+      return;
+    }
+    await this.controller.newSession();
+    this.status("thinking", "Opening a new DeepSeek conversation\u2026");
+    try {
+      await this.bridge.startNewConversation();
+      this.status("completed", "New DeepSeek conversation is ready. Your next task will use it.");
+    } catch (error) {
+      this.status(
+        "failed",
+        `A new local conversation was started, but DeepSeek could not switch to a new chat: ${error instanceof Error ? error.message : "browser bridge error"}`
+      );
+    }
+  }
   html(webview) {
     const script = webview.asWebviewUri(vscode3.Uri.joinPath(this.extensionUri, "dist", "media", "chat.js"));
     const style = webview.asWebviewUri(vscode3.Uri.joinPath(this.extensionUri, "dist", "media", "chat.css"));
+    const logo = webview.asWebviewUri(vscode3.Uri.joinPath(this.extensionUri, "dist", "media", "deepseek.png"));
     const nonce = cryptoNonce();
     return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
   <link rel="stylesheet" href="${style}">
   <title>DeepSeek Code Agent</title>
 </head>
 <body>
   <header class="toolbar">
     <div class="toolbar-heading">
-      <span class="product-mark" aria-hidden="true">D</span>
+      <img class="product-mark" src="${logo}" alt="" aria-hidden="true">
       <strong class="title">DeepSeek Code Agent</strong>
       <span class="provider-label">Browser session</span>
     </div>
     <div class="toolbar-actions">
-      <select id="sessions" aria-label="Choose a conversation"><option value="current">Current conversation</option></select>
+      <details class="conversation-menu">
+        <summary id="conversation-menu-label">DeepSeek conversation</summary>
+        <div class="conversation-menu-panel">
+          <form id="conversation-url-form" class="conversation-url-form">
+            <label for="conversation-url">Conversation URL</label>
+            <div class="conversation-url-row">
+              <input id="conversation-url" type="url" autocomplete="url" spellcheck="false" required>
+              <button id="save-conversation-url" type="submit">Save</button>
+            </div>
+            <div id="conversation-url-state" role="status" aria-live="polite"></div>
+          </form>
+        </div>
+      </details>
+      <label class="visually-hidden" for="connection-mode">Browser reconnection</label>
+      <select id="connection-mode" aria-label="Browser reconnection preference">
+        <option value="auto">Auto connect</option>
+        <option value="manual">Manual connect</option>
+      </select>
       <button id="review-changes" class="icon-button" type="button" hidden aria-label="Review proposed changes" title="Review proposed changes">
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11m-11 4h11m-11 4h7"/></svg>
       </button>
@@ -5811,15 +6114,31 @@ var AgentViewProvider = class {
   </div>
   <main id="messages" class="messages" aria-live="polite">
     <div id="empty-state" class="empty-state">
-      <div class="empty-mark" aria-hidden="true">D</div>
+      <img class="empty-mark" src="${logo}" alt="" aria-hidden="true">
       <strong>What can I help you build?</strong>
       <p>Ask a question or describe a change. The agent uses relevant workspace context and asks before applying edits or running commands.</p>
     </div>
   </main>
   <form id="composer">
     <div class="composer-box">
+      <section id="approval-request" class="approval-request" aria-live="assertive" hidden>
+        <strong id="approval-title"></strong>
+        <p id="approval-detail"></p>
+        <div class="approval-buttons">
+          <button id="approval-reject" type="button">Don't allow</button>
+          <button id="approval-approve" class="approval-confirm" type="button">Approve</button>
+        </div>
+      </section>
       <textarea id="prompt" rows="3" aria-label="Message DeepSeek Code Agent" placeholder="Ask a question or describe a task\u2026" required></textarea>
       <div class="composer-actions">
+        <div class="composer-options">
+          <label class="approval-label" for="approval-mode">Approval</label>
+          <select id="approval-mode" aria-label="Change and command approval mode" title="Auto-apply everything skips prompts for file changes, deletions, and commands accepted by safety checks. npm scripts may perform project-defined actions; blocked commands remain blocked.">
+            <option value="review">Ask before edits / commands</option>
+            <option value="safe-auto">Auto-apply safe changes</option>
+            <option value="auto-all">Auto-apply everything</option>
+          </select>
+        </div>
         <span class="composer-hint">Enter to send \xB7 Shift+Enter for a new line</span>
         <div class="composer-buttons">
           <button id="cancel" type="button" hidden title="Stop the active task">Stop</button>
@@ -5845,8 +6164,17 @@ function cryptoNonce() {
 var bridge;
 var view;
 async function activate(context) {
-  const port = vscode4.workspace.getConfiguration("deepseekCodeAgent").get("bridgePort", 43127);
-  bridge = new BridgeServer(port);
+  const configuration = vscode4.workspace.getConfiguration("deepseekCodeAgent");
+  const port = configuration.get("bridgePort", 43127);
+  let autoConnect = configuration.get("autoConnect", true);
+  const storedToken = autoConnect ? await context.secrets.get("bridgeToken") : void 0;
+  const pairedToken = storedToken && /^[0-9a-f]{64}$/i.test(storedToken) ? storedToken : void 0;
+  if (storedToken && !pairedToken || !autoConnect) await context.secrets.delete("bridgeToken");
+  const getChatUrl = () => vscode4.workspace.getConfiguration("deepseekCodeAgent").get("conversationUrl", import_protocol4.DEFAULT_DEEPSEEK_CHAT_URL);
+  bridge = new BridgeServer(port, getChatUrl, pairedToken, async (url) => {
+    await vscode4.workspace.getConfiguration("deepseekCodeAgent").update("conversationUrl", url, vscode4.ConfigurationTarget.Global);
+    view?.conversationUrlUpdated(url);
+  });
   try {
     await bridge.start();
   } catch (error) {
@@ -5875,7 +6203,28 @@ async function activate(context) {
     }),
     vscode4.commands.registerCommand("deepseekCodeAgent.clearConversation", () => view?.clearConversation()),
     vscode4.commands.registerCommand("deepseekCodeAgent.newSession", () => view?.newSession()),
-    bridge.onDidPair(() => view?.paired()),
+    bridge.onDidPair((token) => {
+      if (autoConnect)
+        void Promise.resolve(context.secrets.store("bridgeToken", token)).catch((error) => {
+          console.error(
+            "[DeepSeek Code Agent] Could not save browser reconnect credentials:",
+            error instanceof Error ? error.name : "unknown error"
+          );
+        });
+      view?.paired();
+    }),
+    vscode4.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration("deepseekCodeAgent.autoConnect")) return;
+      autoConnect = vscode4.workspace.getConfiguration("deepseekCodeAgent").get("autoConnect", true);
+      const reconnectToken = bridge?.reconnectToken;
+      const update = autoConnect && reconnectToken ? context.secrets.store("bridgeToken", reconnectToken) : context.secrets.delete("bridgeToken");
+      void Promise.resolve(update).catch((error) => {
+        console.error(
+          "[DeepSeek Code Agent] Could not update browser auto-connect preference:",
+          error instanceof Error ? error.name : "unknown error"
+        );
+      });
+    }),
     { dispose: () => view?.dispose() },
     {
       dispose: () => {

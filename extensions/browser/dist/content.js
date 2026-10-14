@@ -2,6 +2,7 @@
 (() => {
   // src/chatUrl.ts
   var CHAT_PATH = /^\/a\/chat\/s\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i;
+  var NEW_CHAT_PATH = /^\/$|^\/a\/chat\/s\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i;
   function validateDeepSeekChatUrl(input) {
     let url;
     try {
@@ -26,6 +27,14 @@
       return false;
     }
     return current.protocol === "https:" && current.hostname === "chat.deepseek.com" && current.origin === "https://chat.deepseek.com" && current.pathname.replace(/\/$/, "") === new URL(expected).pathname;
+  }
+  function isDeepSeekNewConversationPage(currentUrl) {
+    try {
+      const url = new URL(currentUrl);
+      return url.protocol === "https:" && url.hostname === "chat.deepseek.com" && url.origin === "https://chat.deepseek.com" && NEW_CHAT_PATH.test(url.pathname);
+    } catch {
+      return false;
+    }
   }
 
   // src/adapter.ts
@@ -59,6 +68,10 @@
   function shouldCommitFinalAnswer(text, started, streaming, stableForMs) {
     return started && Boolean(text.trim()) && !streaming && stableForMs >= 3500;
   }
+  function detectDeepSeekActivity(thinkingVisible, finalAnswerStarted) {
+    if (thinkingVisible) return "thinking";
+    return finalAnswerStarted ? "answering" : void 0;
+  }
   function setInput(input, text) {
     input.focus();
     if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
@@ -84,20 +97,25 @@
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
     input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
   }
-  async function runDeepSeekPrompt(prompt, chatUrl, timeoutMs = 18e4) {
+  async function runDeepSeekPrompt(prompt, chatUrl, timeoutMs = 18e4, onActivity, newConversation = false) {
     if (!isDeepSeekHost(location.hostname))
       return { ok: false, error: "Open the official DeepSeek chat website and sign in first." };
-    try {
-      if (!isDeepSeekConversationUrl(location.href, chatUrl))
+    if (newConversation) {
+      if (!isDeepSeekNewConversationPage(location.href))
+        return { ok: false, error: "The new DeepSeek conversation page is not open. Click New conversation and retry." };
+    } else {
+      try {
+        if (!isDeepSeekConversationUrl(location.href, chatUrl))
+          return {
+            ok: false,
+            error: "The active DeepSeek tab is not the configured conversation. Check the saved chat URL and retry."
+          };
+      } catch {
         return {
           ok: false,
-          error: "The active DeepSeek tab is not the configured conversation. Check the saved chat URL and retry."
+          error: "The configured DeepSeek conversation URL is invalid. Set a valid chat.deepseek.com conversation URL in VS Code settings."
         };
-    } catch {
-      return {
-        ok: false,
-        error: "The configured DeepSeek conversation URL is invalid. Save a valid chat.deepseek.com conversation URL in the extension popup."
-      };
+      }
     }
     const input = findInput();
     if (!input)
@@ -117,7 +135,9 @@
       let lastText = "";
       let stableSince = Date.now();
       let responseStarted = false;
+      let lastActivity;
       let finished = false;
+      const isExpectedPage = () => newConversation ? isDeepSeekNewConversationPage(location.href) : isDeepSeekConversationUrl(location.href, chatUrl);
       const finish = (result) => {
         if (finished) return;
         finished = true;
@@ -129,7 +149,7 @@
       const cancel = () => finish({ ok: false, error: "Request cancelled by VS Code." });
       activeRequest = cancel;
       const inspect = () => {
-        if (!isDeepSeekConversationUrl(location.href, chatUrl)) {
+        if (!isExpectedPage()) {
           finish({
             ok: false,
             error: "The DeepSeek page navigated away from the configured conversation before its response completed."
@@ -138,8 +158,14 @@
         }
         const nodes = responseNodes();
         const response = selectLatestFinalAnswer(nodes.map((node) => ({ text: node.innerText, isThinking: false })));
+        const isThinking = [...document.querySelectorAll(THINKING_SELECTOR)].some(visible);
         if (response && (nodes.length > before.length || response !== previousLast)) {
           responseStarted = true;
+        }
+        const activity = detectDeepSeekActivity(isThinking, responseStarted);
+        if (activity && lastActivity !== activity) {
+          lastActivity = activity;
+          onActivity?.(activity);
         }
         if (response !== lastText) {
           lastText = response;
@@ -150,8 +176,20 @@
           const label = `${button.getAttribute("aria-label") ?? ""} ${button.title} ${button.textContent ?? ""}`.toLowerCase();
           return /stop|interrupt|停止/.test(label);
         });
-        if (shouldCommitFinalAnswer(lastText, responseStarted, streaming, Date.now() - stableSince))
-          finish({ ok: true, response: lastText });
+        if (shouldCommitFinalAnswer(lastText, responseStarted, streaming, Date.now() - stableSince)) {
+          if (newConversation && !isDeepSeekConversationPage(location.href)) {
+            finish({
+              ok: false,
+              error: "DeepSeek answered, but did not expose a conversation URL. The new chat was not saved as the active conversation."
+            });
+            return;
+          }
+          finish({
+            ok: true,
+            response: lastText,
+            ...newConversation ? { conversationUrl: `${location.origin}${location.pathname.replace(/\/$/, "")}` } : {}
+          });
+        }
         if (Date.now() - started > timeoutMs) {
           finish({
             ok: false,
@@ -174,6 +212,19 @@
     }
     return { available: isDeepSeekHost(location.hostname) && intendedChat && findInput() !== null, intendedChat };
   }
+  function deepSeekNewConversationStatus() {
+    const intendedChat = isDeepSeekHost(location.hostname) && isDeepSeekNewConversationPage(location.href);
+    return { available: intendedChat && findInput() !== null, intendedChat };
+  }
+  function isDeepSeekConversationPage(currentUrl) {
+    try {
+      const url = new URL(currentUrl);
+      validateDeepSeekChatUrl(`${url.origin}${url.pathname}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   function cancelDeepSeekPrompt() {
     activeRequest?.();
   }
@@ -188,6 +239,10 @@
       sendResponse(typeof chatUrl === "string" ? deepSeekPageStatus(chatUrl) : { available: false, intendedChat: false });
       return false;
     }
+    if (message?.type === "check-new-conversation") {
+      sendResponse(deepSeekNewConversationStatus());
+      return false;
+    }
     if (message?.type === "cancel-prompt") {
       cancelDeepSeekPrompt();
       sendResponse({ ok: true });
@@ -195,12 +250,16 @@
     }
     if (message?.type !== "run-prompt" || typeof message.prompt !== "string" || typeof message.chatUrl !== "string")
       return;
-    void runDeepSeekPrompt(message.prompt, message.chatUrl, message.timeoutMs).then(sendResponse);
+    void runDeepSeekPrompt(
+      message.prompt,
+      message.chatUrl,
+      message.timeoutMs,
+      (activity) => {
+        void chrome.runtime.sendMessage({ type: "thinking-state", activity }).catch(() => void 0);
+      },
+      message.newConversation === true
+    ).then(sendResponse);
     return true;
-  });
-  void chrome.storage.local.get("chatUrl").then(({ chatUrl }) => {
-    const status = typeof chatUrl === "string" ? deepSeekPageStatus(chatUrl) : { available: false, intendedChat: false };
-    return chrome.runtime.sendMessage({ type: "page-health", ...status, url: location.href }).catch(() => void 0);
   });
 })();
 //# sourceMappingURL=content.js.map

@@ -1,14 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { isDeepSeekHost, selectLatestFinalAnswer, shouldCommitFinalAnswer } from "./adapter";
+import { detectDeepSeekActivity, isDeepSeekHost, selectLatestFinalAnswer, shouldCommitFinalAnswer } from "./adapter";
 import {
-  DEFAULT_CHAT_URL,
   isConfiguredChatReady,
   isDeepSeekConversationUrl,
-  persistDeepSeekChatUrl,
+  isDeepSeekNewConversationPage,
   planConversationTab,
   validateDeepSeekChatUrl,
 } from "./chatUrl";
 import { waitForReadiness, waitForReadinessWithReload } from "./readiness";
+
+const CHAT_URL = "https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c";
 
 describe("DeepSeek adapter", () => {
   it("accepts only the official DeepSeek chat host", () => {
@@ -36,8 +37,14 @@ describe("DeepSeek adapter", () => {
     expect(shouldCommitFinalAnswer("answer", true, false, 3_500)).toBe(true);
   });
 
+  it("reports DeepSeek activity without forwarding its thinking text", () => {
+    expect(detectDeepSeekActivity(false, false)).toBeUndefined();
+    expect(detectDeepSeekActivity(true, false)).toBe("thinking");
+    expect(detectDeepSeekActivity(false, true)).toBe("answering");
+  });
+
   it("accepts only official HTTPS conversation URLs with a chat ID", () => {
-    expect(validateDeepSeekChatUrl(DEFAULT_CHAT_URL)).toBe(DEFAULT_CHAT_URL);
+    expect(validateDeepSeekChatUrl(CHAT_URL)).toBe(CHAT_URL);
     for (const url of [
       "http://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c",
       "https://deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c",
@@ -49,66 +56,29 @@ describe("DeepSeek adapter", () => {
     }
   });
 
-  it("persists a validated conversation URL without saving invalid values", async () => {
-    const values = new Map<string, string>();
-    const storage = {
-      async get(keys: string | string[]) {
-        const result: Record<string, unknown> = {};
-        for (const key of typeof keys === "string" ? [keys] : keys) {
-          const value = values.get(key);
-          if (value !== undefined) result[key] = value;
-        }
-        return result;
-      },
-      async set(items: Record<string, string>) {
-        for (const [key, value] of Object.entries(items)) values.set(key, value);
-      },
-    };
-    await expect(persistDeepSeekChatUrl(DEFAULT_CHAT_URL, storage)).resolves.toBe(DEFAULT_CHAT_URL);
-    expect(values.get("chatUrl")).toBe(DEFAULT_CHAT_URL);
-    await expect(
-      persistDeepSeekChatUrl("https://chat.deepseek.com/a/chat/s/11111111-2222-3333-4444-555555555555", storage),
-    ).resolves.toBe("https://chat.deepseek.com/a/chat/s/11111111-2222-3333-4444-555555555555");
-    expect(values.get("chatUrl")).toBe("https://chat.deepseek.com/a/chat/s/11111111-2222-3333-4444-555555555555");
-    await expect(persistDeepSeekChatUrl("http://evil.example", storage)).rejects.toThrow(/conversation URL/);
-    expect(values.get("chatUrl")).toBe("https://chat.deepseek.com/a/chat/s/11111111-2222-3333-4444-555555555555");
-  });
-
-  it("reports a storage write that did not actually persist", async () => {
-    let writes = 0;
-    const storage = {
-      async get() {
-        return {
-          chatUrl: "https://chat.deepseek.com/a/chat/s/11111111-2222-3333-4444-555555555555",
-        };
-      },
-      async set() {
-        writes += 1;
-      },
-    };
-    await expect(persistDeepSeekChatUrl(DEFAULT_CHAT_URL, storage)).rejects.toThrow(/could not verify/);
-    expect(writes).toBe(1);
-  });
-
   it("confirms the current page is the configured conversation", () => {
-    expect(isDeepSeekConversationUrl(DEFAULT_CHAT_URL, DEFAULT_CHAT_URL)).toBe(true);
+    expect(isDeepSeekConversationUrl(CHAT_URL, CHAT_URL)).toBe(true);
     expect(
-      isDeepSeekConversationUrl(
-        "https://chat.deepseek.com/a/chat/s/11111111-2222-3333-4444-555555555555",
-        DEFAULT_CHAT_URL,
-      ),
+      isDeepSeekConversationUrl("https://chat.deepseek.com/a/chat/s/11111111-2222-3333-4444-555555555555", CHAT_URL),
     ).toBe(false);
     expect(
-      isDeepSeekConversationUrl("https://evil.example/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c", DEFAULT_CHAT_URL),
+      isDeepSeekConversationUrl("https://evil.example/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c", CHAT_URL),
     ).toBe(false);
+  });
+
+  it("recognizes only official new-chat and conversation pages", () => {
+    expect(isDeepSeekNewConversationPage("https://chat.deepseek.com/")).toBe(true);
+    expect(isDeepSeekNewConversationPage(CHAT_URL)).toBe(true);
+    expect(isDeepSeekNewConversationPage("https://chat.deepseek.com/login")).toBe(false);
+    expect(isDeepSeekNewConversationPage("https://example.com/")).toBe(false);
   });
 
   it("reuses the intended tab, then an active DeepSeek tab, before opening another", () => {
-    const intended = { id: 1, url: DEFAULT_CHAT_URL };
+    const intended = { id: 1, url: CHAT_URL };
     const active = { id: 2, url: "https://chat.deepseek.com/", active: true };
-    expect(planConversationTab([active, intended], DEFAULT_CHAT_URL)).toEqual({ action: "reuse", tab: intended });
-    expect(planConversationTab([active], DEFAULT_CHAT_URL)).toEqual({ action: "navigate", tab: active });
-    expect(planConversationTab([], DEFAULT_CHAT_URL)).toEqual({ action: "open" });
+    expect(planConversationTab([active, intended], CHAT_URL)).toEqual({ action: "reuse", tab: intended });
+    expect(planConversationTab([active], CHAT_URL)).toEqual({ action: "navigate", tab: active });
+    expect(planConversationTab([], CHAT_URL)).toEqual({ action: "open" });
   });
 
   it("does not equate bridge pairing with a ready matching chat page", () => {

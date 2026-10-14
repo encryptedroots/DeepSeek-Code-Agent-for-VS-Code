@@ -82,5 +82,7 @@ class MockProvider {
         ]);
         const result = await (0, index_1.requestStructuredPlan)(provider, "Make a configuration change", "Relevant files", 10_000, new AbortController().signal);
         (0, vitest_1.expect)(result.clarification).toBe("Which configuration file should be changed?");
+        (0, vitest_1.expect)(provider.prompts[0]).toContain("Phrase it naturally as a direct conversational message");
+        (0, vitest_1.expect)(provider.prompts[0]).toContain("If the user only greets or makes small talk");
     });
 });

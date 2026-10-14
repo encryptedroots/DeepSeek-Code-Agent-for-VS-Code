@@ -5,6 +5,8 @@ import {
   bridgeProgressSchema,
   bridgeResultSchema,
   bridgeJobSchema,
+  DEFAULT_DEEPSEEK_CHAT_URL,
+  validateDeepSeekChatUrl,
 } from "@deepseek-agent/protocol";
 
 interface PendingRequest {
@@ -12,15 +14,30 @@ interface PendingRequest {
   reject: (error: Error) => void;
 }
 
+interface PendingNewConversation {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class BridgeServer {
   private server: Server | undefined;
-  private readonly token = randomBytes(32).toString("hex");
-  private pairingCode = String(randomInt(10_000_000, 100_000_000));
+  private readonly token: string;
+  private pairingCode: string;
   private pairingAttempts = 0;
-  private paired = false;
+  private paired: boolean;
   private lastBrowserPoll = 0;
-  private readonly pairListeners = new Set<() => void>();
-  private readonly queue: Array<{ id: string; prompt: string; responseLimit: number }> = [];
+  private readonly pairListeners = new Set<(token: string) => void>();
+  private readonly queue: Array<{
+    id: string;
+    prompt: string;
+    responseLimit: number;
+    chatUrl: string;
+    newConversation?: boolean;
+  }> = [];
+  private readonly newConversationQueue: string[] = [];
+  private readonly pendingNewConversations = new Map<string, PendingNewConversation>();
+  private newConversationForNextTask = false;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly progress = new Map<
     string,
@@ -29,7 +46,16 @@ export class BridgeServer {
   private readonly activities = new Map<string, (activity: "thinking" | "answering") => void>();
   private readonly cancelled = new Set<string>();
 
-  constructor(private readonly port: number) {}
+  constructor(
+    private readonly port: number,
+    private readonly getChatUrl: () => string = () => DEFAULT_DEEPSEEK_CHAT_URL,
+    pairedToken?: string,
+    private readonly onConversationUrl?: (url: string) => Promise<void>,
+  ) {
+    this.token = pairedToken ?? randomBytes(32).toString("hex");
+    this.paired = pairedToken !== undefined;
+    this.pairingCode = pairedToken === undefined ? String(randomInt(10_000_000, 100_000_000)) : "";
+  }
 
   get code(): string {
     return this.pairingCode;
@@ -45,11 +71,15 @@ export class BridgeServer {
     return this.paired;
   }
 
+  get reconnectToken(): string | undefined {
+    return this.paired ? this.token : undefined;
+  }
+
   get browserActive(): boolean {
     return this.paired && Date.now() - this.lastBrowserPoll < 90_000;
   }
 
-  onDidPair(listener: () => void): { dispose: () => void } {
+  onDidPair(listener: (token: string) => void): { dispose: () => void } {
     this.pairListeners.add(listener);
     return { dispose: () => this.pairListeners.delete(listener) };
   }
@@ -80,6 +110,11 @@ export class BridgeServer {
   async stop(): Promise<void> {
     for (const request of this.pending.values()) request.reject(new Error("The browser bridge was stopped."));
     this.pending.clear();
+    for (const pending of this.pendingNewConversations.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("The browser bridge was stopped."));
+    }
+    this.pendingNewConversations.clear();
     this.progress.clear();
     this.activities.clear();
     this.queue.length = 0;
@@ -107,7 +142,21 @@ export class BridgeServer {
         ),
       );
     if (signal.aborted) return Promise.reject(new Error("Task cancelled."));
-    const job = bridgeJobSchema.safeParse({ id: randomUUID(), prompt, responseLimit });
+    let chatUrl: string;
+    try {
+      chatUrl = validateDeepSeekChatUrl(this.getChatUrl());
+    } catch (error) {
+      return Promise.reject(
+        error instanceof Error ? error : new Error("Configured DeepSeek conversation URL is invalid."),
+      );
+    }
+    const job = bridgeJobSchema.safeParse({
+      id: randomUUID(),
+      prompt,
+      responseLimit,
+      chatUrl,
+      newConversation: this.newConversationForNextTask,
+    });
     if (!job.success) return Promise.reject(new Error("Bridge request did not match the supported protocol."));
     const id = job.data.id;
     return new Promise<string>((resolve, reject) => {
@@ -180,12 +229,18 @@ export class BridgeServer {
       }
       this.paired = true;
       this.pairingCode = "";
-      for (const listener of this.pairListeners) listener();
+      for (const listener of this.pairListeners) listener(this.token);
       this.send(response, 200, { token: this.token });
       return;
     }
     if (pathname === "/health" && request.method === "GET") {
-      this.send(response, 200, { ok: true, paired: this.paired, browserActive: this.browserActive });
+      let chatUrl: string | undefined;
+      try {
+        chatUrl = validateDeepSeekChatUrl(this.getChatUrl());
+      } catch {
+        chatUrl = undefined;
+      }
+      this.send(response, 200, { ok: true, paired: this.paired, browserActive: this.browserActive, chatUrl });
       return;
     }
     if (!this.authorized(request)) {
@@ -194,6 +249,11 @@ export class BridgeServer {
     }
     if (pathname === "/next" && request.method === "GET") {
       this.lastBrowserPoll = Date.now();
+      const newConversationId = this.newConversationQueue.shift();
+      if (newConversationId) {
+        this.send(response, 200, { type: "new-conversation", id: newConversationId });
+        return;
+      }
       const job = this.queue.shift();
       if (!job) {
         response.writeHead(204);
@@ -223,12 +283,68 @@ export class BridgeServer {
         this.send(response, 404, { error: "Request expired or was cancelled." });
         return;
       }
+      if (parsed.data.conversationUrl) {
+        try {
+          await this.onConversationUrl?.(parsed.data.conversationUrl);
+          this.newConversationForNextTask = false;
+        } catch (error) {
+          this.pending.delete(parsed.data.id);
+          this.progress.delete(parsed.data.id);
+          this.activities.delete(parsed.data.id);
+          pending.reject(
+            new Error(
+              `DeepSeek created a new conversation, but VS Code could not save its URL: ${error instanceof Error ? error.message : "settings update failed"}`,
+            ),
+          );
+          this.send(response, 200, { ok: true });
+          return;
+        }
+      }
       this.pending.delete(parsed.data.id);
       this.progress.delete(parsed.data.id);
       this.activities.delete(parsed.data.id);
       if (parsed.data.error) pending.reject(new Error(parsed.data.error));
       else if (parsed.data.response) pending.resolve(parsed.data.response);
       else pending.reject(new Error("Browser returned an empty response."));
+      this.send(response, 200, { ok: true });
+      return;
+    }
+    if (pathname === "/new-conversation/complete" && request.method === "POST") {
+      const body = await this.readBody(request, response);
+      if (body === undefined) return;
+      let input: unknown;
+      try {
+        input = JSON.parse(body);
+      } catch {
+        this.send(response, 400, { error: "Invalid new-conversation result." });
+        return;
+      }
+      if (
+        typeof input !== "object" ||
+        input === null ||
+        !("id" in input) ||
+        typeof input.id !== "string" ||
+        !("ok" in input) ||
+        typeof input.ok !== "boolean" ||
+        ("error" in input && (typeof input.error !== "string" || input.error.length > 2_000))
+      ) {
+        this.send(response, 400, { error: "Browser returned an invalid new-conversation result." });
+        return;
+      }
+      const pending = this.pendingNewConversations.get(input.id);
+      if (!pending) {
+        this.send(response, 404, { error: "New-conversation request expired." });
+        return;
+      }
+      this.pendingNewConversations.delete(input.id);
+      clearTimeout(pending.timer);
+      if (input.ok) {
+        this.newConversationForNextTask = true;
+        pending.resolve();
+      } else {
+        const message = "error" in input && typeof input.error === "string" ? input.error : undefined;
+        pending.reject(new Error(message || "Could not open a new DeepSeek conversation."));
+      }
       this.send(response, 200, { ok: true });
       return;
     }
@@ -292,6 +408,24 @@ export class BridgeServer {
       return;
     }
     this.send(response, 404, { error: "Unknown bridge endpoint." });
+  }
+
+  startNewConversation(): Promise<void> {
+    if (!this.paired)
+      return Promise.reject(new Error("Pair the browser extension before opening a new DeepSeek conversation."));
+    if (this.newConversationForNextTask || this.pendingNewConversations.size)
+      return Promise.reject(new Error("A new DeepSeek conversation is already being prepared."));
+    const id = randomUUID();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingNewConversations.delete(id);
+        const queuedIndex = this.newConversationQueue.indexOf(id);
+        if (queuedIndex >= 0) this.newConversationQueue.splice(queuedIndex, 1);
+        reject(new Error("Timed out waiting for the browser to open a new DeepSeek conversation."));
+      }, 30_000);
+      this.pendingNewConversations.set(id, { resolve, reject, timer });
+      this.newConversationQueue.push(id);
+    });
   }
 
   private authorized(request: IncomingMessage): boolean {

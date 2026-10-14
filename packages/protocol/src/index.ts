@@ -129,11 +129,48 @@ function redactSensitiveText(text: string): string {
     );
 }
 
+export const DEFAULT_DEEPSEEK_CHAT_URL = "https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c";
+
+export function validateDeepSeekChatUrl(input: string): string {
+  let url: URL;
+  try {
+    url = new URL(input.trim());
+  } catch {
+    throw new Error("Enter a valid DeepSeek conversation URL.");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== "chat.deepseek.com" ||
+    url.origin !== "https://chat.deepseek.com" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !/^\/a\/chat\/s\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i.test(url.pathname)
+  ) {
+    throw new Error("Use an HTTPS conversation URL from chat.deepseek.com with a valid chat ID.");
+  }
+  return `https://chat.deepseek.com${url.pathname.replace(/\/$/, "")}`;
+}
+
+const deepSeekChatUrlSchema = z
+  .string()
+  .max(2_048)
+  .refine((value) => {
+    try {
+      return validateDeepSeekChatUrl(value) === value;
+    } catch {
+      return false;
+    }
+  }, "Use a valid HTTPS chat.deepseek.com conversation URL.");
+
 export const bridgeJobSchema = z
   .object({
     id: z.string().uuid(),
     prompt: z.string().min(1).max(400_000),
     responseLimit: z.number().int().positive().max(200_000),
+    chatUrl: deepSeekChatUrlSchema,
+    newConversation: z.boolean().optional(),
   })
   .strict();
 
@@ -142,6 +179,7 @@ export const bridgeResultSchema = z
     id: z.string().uuid(),
     response: z.string().min(1).max(200_000).optional(),
     error: z.string().max(2_000).optional(),
+    conversationUrl: deepSeekChatUrlSchema.optional(),
   })
   .strict()
   .refine((result) => Boolean(result.response) !== Boolean(result.error), "Provide either a response or an error");
@@ -206,7 +244,7 @@ export function protocolInstructions(): string {
     "You are the reasoning engine for a local coding agent. Focus on the current task; use earlier chat only when clearly relevant. Inspect relevant context and conventions; make minimal coherent changes and preserve behavior. Plan privately, then return one JSON object only.",
     'Schema: {"version":1,"plan":"...","operations":[],"commands":[],"verification":[],"summary":"...","clarification":"optional question","requestedFiles":[],"searches":[]}.',
     'Operations: {"type":"create","path":"relative/path","content":"complete file"}; {"type":"replace","path":"relative/path","edits":[{"search":"exact text","replace":"replacement","expectedOccurrences":1}]}; {"type":"delete","path":"relative/path"}.',
-    "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches.",
+    "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches. Phrase it naturally as a direct conversational message without labels such as 'DeepSeek needs clarification'. If the user only greets or makes small talk, reply warmly and briefly, then invite them to say what they need.",
     "Follow the supplied schema exactly. Escape all quotes, backslashes, and newlines inside JSON strings. Do not infer successful verification; use observed command results only.",
   ].join("\n");
 }

@@ -2,7 +2,7 @@
   "name": "deepseek-code-agent-vscode",
   "displayName": "DeepSeek Code Agent",
   "description": "A reviewed, local coding agent using your authenticated DeepSeek web session.",
-  "version": "0.1.0",
+  "version": "0.1.12",
   "publisher": "deepseek-code-agent",
   "engines": {
     "vscode": "^1.97.0"
@@ -51,6 +51,16 @@
     "configuration": {
       "title": "DeepSeek Code Agent",
       "properties": {
+        "deepseekCodeAgent.conversationUrl": {
+          "type": "string",
+          "default": "https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c",
+          "description": "HTTPS conversation URL on chat.deepseek.com used by the paired browser extension."
+        },
+        "deepseekCodeAgent.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reconnect automatically to a browser extension paired once with the one-time code. Does not skip initial pairing."
+        },
         "deepseekCodeAgent.bridgePort": {
           "type": "number",
           "default": 43127,

@@ -138,30 +138,6 @@
         background: #375bd2;
         border-color: #375bd2;
       }
-      .save-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-      .save-row input {
-        flex: 1;
-        min-width: 0;
-      }
-      #save-chat-url {
-        flex: 0 0 auto;
-      }
-      #save-state {
-        min-height: 15px;
-        margin: 5px 0 0;
-        color: var(--muted);
-        font-size: 12px;
-      }
-      #save-state[data-state="saved"] {
-        color: var(--success);
-      }
-      #save-state[data-state="error"] {
-        color: var(--error);
-      }
       .connection-actions {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -219,33 +195,14 @@
       </div>
     </header>
 
-    <section aria-labelledby="conversation-heading">
-      <div class="section-heading">
-        <h2 id="conversation-heading">Conversation link</h2>
-      </div>
-      <label for="chat-url">DeepSeek conversation URL</label>
-      <form id="chat-url-form" class="save-row">
-        <input
-          id="chat-url"
-          type="url"
-          autocomplete="url"
-          spellcheck="false"
-          value="https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c"
-          aria-describedby="chat-url-help save-state"
-          required
-        />
-        <button id="save-chat-url" class="primary" type="submit">Save</button>
-      </form>
-      <small id="chat-url-help" class="help">Paste a chat.deepseek.com conversation link, then save it.</small>
-      <div id="save-state" role="status" aria-live="polite"></div>
-    </section>
-
     <section aria-labelledby="pair-heading">
       <div class="section-heading">
         <span class="step">01</span>
         <h2 id="pair-heading">Connect VS Code</h2>
       </div>
-      <p class="section-description">Pair once with the code shown in the VS Code sidebar.</p>
+      <p class="section-description">
+        Pair once with the code shown in the VS Code sidebar. Choose your conversation URL in VS Code settings.
+      </p>
       <label for="bridge-url">Local bridge address</label>
       <input id="bridge-url" type="url" value="http://127.0.0.1:43127" autocomplete="url" />
       <label for="pairing">One-time pairing code</label>

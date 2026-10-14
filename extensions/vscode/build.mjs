@@ -23,3 +23,4 @@ await build({
   sourcemap: true,
 });
 await cp("media/chat.css", "dist/media/chat.css");
+await cp("../browser/icons/deepseek.png", "dist/media/deepseek.png");

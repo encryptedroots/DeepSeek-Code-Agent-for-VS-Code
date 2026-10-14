@@ -1,7 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.bridgeProgressSchema = exports.bridgeResultSchema = exports.bridgeJobSchema = exports.agentResponseSchema = void 0;
+exports.bridgeActivitySchema = exports.bridgeProgressSchema = exports.bridgeResultSchema = exports.bridgeJobSchema = exports.DEFAULT_DEEPSEEK_CHAT_URL = exports.agentResponseSchema = void 0;
 exports.requestStructuredPlan = requestStructuredPlan;
+exports.validateDeepSeekChatUrl = validateDeepSeekChatUrl;
 exports.parseAgentResponse = parseAgentResponse;
 exports.protocolInstructions = protocolInstructions;
 const zod_1 = require("zod");
@@ -64,7 +65,7 @@ async function requestStructuredPlan(provider, task, context, responseLimit, sig
     let requestPrompt = instruction;
     let lastError;
     for (let attempt = 0; attempt <= MAX_RESPONSE_REPAIRS; attempt += 1) {
-        const response = await provider.request(requestPrompt, responseLimit, signal, onProgress);
+        const response = await provider.request(requestPrompt, responseLimit, signal, onProgress, options.onActivity);
         try {
             if (new TextEncoder().encode(response).byteLength > responseLimit)
                 throw new Error("DeepSeek response exceeded the configured size limit.");
@@ -93,11 +94,45 @@ function redactSensitiveText(text) {
         .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]")
         .replace(/(["']?[\w.-]*(?:api[_-]?key|access[_-]?token|secret|password|passwd|private[_-]?key|authorization)[\w.-]*["']?\s*[:=]\s*["']?)[^"',\s}\r\n]+/gi, "$1[REDACTED]");
 }
+exports.DEFAULT_DEEPSEEK_CHAT_URL = "https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c";
+function validateDeepSeekChatUrl(input) {
+    let url;
+    try {
+        url = new URL(input.trim());
+    }
+    catch {
+        throw new Error("Enter a valid DeepSeek conversation URL.");
+    }
+    if (url.protocol !== "https:" ||
+        url.hostname !== "chat.deepseek.com" ||
+        url.origin !== "https://chat.deepseek.com" ||
+        url.username ||
+        url.password ||
+        url.search ||
+        url.hash ||
+        !/^\/a\/chat\/s\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i.test(url.pathname)) {
+        throw new Error("Use an HTTPS conversation URL from chat.deepseek.com with a valid chat ID.");
+    }
+    return `https://chat.deepseek.com${url.pathname.replace(/\/$/, "")}`;
+}
+const deepSeekChatUrlSchema = zod_1.z
+    .string()
+    .max(2_048)
+    .refine((value) => {
+    try {
+        return validateDeepSeekChatUrl(value) === value;
+    }
+    catch {
+        return false;
+    }
+}, "Use a valid HTTPS chat.deepseek.com conversation URL.");
 exports.bridgeJobSchema = zod_1.z
     .object({
     id: zod_1.z.string().uuid(),
     prompt: zod_1.z.string().min(1).max(400_000),
     responseLimit: zod_1.z.number().int().positive().max(200_000),
+    chatUrl: deepSeekChatUrlSchema,
+    newConversation: zod_1.z.boolean().optional(),
 })
     .strict();
 exports.bridgeResultSchema = zod_1.z
@@ -105,6 +140,7 @@ exports.bridgeResultSchema = zod_1.z
     id: zod_1.z.string().uuid(),
     response: zod_1.z.string().min(1).max(200_000).optional(),
     error: zod_1.z.string().max(2_000).optional(),
+    conversationUrl: deepSeekChatUrlSchema.optional(),
 })
     .strict()
     .refine((result) => Boolean(result.response) !== Boolean(result.error), "Provide either a response or an error");
@@ -112,6 +148,12 @@ exports.bridgeProgressSchema = zod_1.z
     .object({
     id: zod_1.z.string().uuid(),
     text: zod_1.z.string().max(200_000),
+})
+    .strict();
+exports.bridgeActivitySchema = zod_1.z
+    .object({
+    id: zod_1.z.string().uuid(),
+    activity: zod_1.z.enum(["thinking", "answering"]),
 })
     .strict();
 function parseAgentResponse(input) {
@@ -161,7 +203,7 @@ function protocolInstructions() {
         "You are the reasoning engine for a local coding agent. Focus on the current task; use earlier chat only when clearly relevant. Inspect relevant context and conventions; make minimal coherent changes and preserve behavior. Plan privately, then return one JSON object only.",
         'Schema: {"version":1,"plan":"...","operations":[],"commands":[],"verification":[],"summary":"...","clarification":"optional question","requestedFiles":[],"searches":[]}.',
         'Operations: {"type":"create","path":"relative/path","content":"complete file"}; {"type":"replace","path":"relative/path","edits":[{"search":"exact text","replace":"replacement","expectedOccurrences":1}]}; {"type":"delete","path":"relative/path"}.',
-        "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches.",
+        "Use only workspace-relative paths; never emit editing scripts or claim commands ran. For missing context, request files/searches with no operations. Ask clarification only for materially ambiguous requirements; then provide only the question, with no operations, commands, file requests, or searches. Phrase it naturally as a direct conversational message without labels such as 'DeepSeek needs clarification'. If the user only greets or makes small talk, reply warmly and briefly, then invite them to say what they need.",
         "Follow the supplied schema exactly. Escape all quotes, backslashes, and newlines inside JSON strings. Do not infer successful verification; use observed command results only.",
     ].join("\n");
 }

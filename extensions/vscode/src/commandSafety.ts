@@ -3,6 +3,8 @@ export interface ParsedCommand {
   args: string[];
 }
 
+export type ApprovalMode = "review" | "safe-auto" | "auto-all";
+
 const TOKEN = /^[\w@./:=+,-]+$/;
 const SAFE_NPM_COMMANDS = ["run", "test", "start", "list", "ls", "help", "prefix", "root"];
 
@@ -54,4 +56,14 @@ export function parseSafeCommand(command: string): ParsedCommand {
 
 export function isTrustedCommand(command: string, trusted: string[]): boolean {
   return trusted.some((entry) => entry.trim() === command.trim());
+}
+
+export function shouldAskForCommandApproval(command: string, trusted: string[], mode: ApprovalMode): boolean {
+  if (mode === "review") return true;
+  if (mode === "auto-all") return false;
+  return !isTrustedCommand(command, trusted);
+}
+
+export function shouldAskForFileApproval(mode: ApprovalMode, containsDeletion: boolean): boolean {
+  return mode === "review" || (mode === "safe-auto" && containsDeletion);
 }

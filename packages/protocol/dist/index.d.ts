@@ -166,44 +166,58 @@ export declare const agentResponseSchema: z.ZodEffects<z.ZodObject<{
 export type AgentResponse = z.infer<typeof agentResponseSchema>;
 export type FileOperation = AgentResponse["operations"][number];
 export interface StructuredResponseProvider {
-    request(prompt: string, responseLimit: number, signal: AbortSignal, onProgress?: (partial: string) => void): Promise<string>;
+    request(prompt: string, responseLimit: number, signal: AbortSignal, onProgress?: (partial: string) => void, onActivity?: (activity: "thinking" | "answering") => void): Promise<string>;
 }
 export declare function requestStructuredPlan(provider: StructuredResponseProvider, task: string, context: string, responseLimit: number, signal: AbortSignal, onProgress?: (partial: string) => void, options?: {
     includeProtocol?: boolean;
+    onActivity?: (activity: "thinking" | "answering") => void;
 }): Promise<AgentResponse>;
+export declare const DEFAULT_DEEPSEEK_CHAT_URL = "https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c";
+export declare function validateDeepSeekChatUrl(input: string): string;
 export declare const bridgeJobSchema: z.ZodObject<{
     id: z.ZodString;
     prompt: z.ZodString;
     responseLimit: z.ZodNumber;
+    chatUrl: z.ZodEffects<z.ZodString, string, string>;
+    newConversation: z.ZodOptional<z.ZodBoolean>;
 }, "strict", z.ZodTypeAny, {
     id: string;
     prompt: string;
     responseLimit: number;
+    chatUrl: string;
+    newConversation?: boolean | undefined;
 }, {
     id: string;
     prompt: string;
     responseLimit: number;
+    chatUrl: string;
+    newConversation?: boolean | undefined;
 }>;
 export declare const bridgeResultSchema: z.ZodEffects<z.ZodObject<{
     id: z.ZodString;
     response: z.ZodOptional<z.ZodString>;
     error: z.ZodOptional<z.ZodString>;
+    conversationUrl: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
 }, "strict", z.ZodTypeAny, {
     id: string;
     response?: string | undefined;
     error?: string | undefined;
+    conversationUrl?: string | undefined;
 }, {
     id: string;
     response?: string | undefined;
     error?: string | undefined;
+    conversationUrl?: string | undefined;
 }>, {
     id: string;
     response?: string | undefined;
     error?: string | undefined;
+    conversationUrl?: string | undefined;
 }, {
     id: string;
     response?: string | undefined;
     error?: string | undefined;
+    conversationUrl?: string | undefined;
 }>;
 export declare const bridgeProgressSchema: z.ZodObject<{
     id: z.ZodString;
@@ -214,6 +228,16 @@ export declare const bridgeProgressSchema: z.ZodObject<{
 }, {
     id: string;
     text: string;
+}>;
+export declare const bridgeActivitySchema: z.ZodObject<{
+    id: z.ZodString;
+    activity: z.ZodEnum<["thinking", "answering"]>;
+}, "strict", z.ZodTypeAny, {
+    id: string;
+    activity: "thinking" | "answering";
+}, {
+    id: string;
+    activity: "thinking" | "answering";
 }>;
 export declare function parseAgentResponse(input: string): AgentResponse;
 export declare function protocolInstructions(): string;

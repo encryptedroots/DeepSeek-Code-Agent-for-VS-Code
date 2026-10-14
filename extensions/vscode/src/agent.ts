@@ -10,10 +10,18 @@ import {
   type StructuredResponseProvider,
 } from "@deepseek-agent/protocol";
 import { ContextCollector, redactSecrets, type CollectedContext } from "./context";
-import { isTrustedCommand, parseSafeCommand, type ParsedCommand } from "./commandSafety";
+import {
+  parseSafeCommand,
+  shouldAskForCommandApproval,
+  shouldAskForFileApproval,
+  type ApprovalMode,
+  type ParsedCommand,
+} from "./commandSafety";
 import { TaskState, type TaskStatus } from "./state";
 import { buildTaskPrompt } from "./taskPrompt";
 import { composeBoundedTaskContext } from "./contextRanking";
+
+export type { ApprovalMode } from "./commandSafety";
 
 export interface AgentUi {
   status(status: TaskStatus, message: string): void;
@@ -21,6 +29,9 @@ export interface AgentUi {
   append(role: "user" | "assistant", text: string): void;
   clear(): void;
   stream(text: string): void;
+  activity?(activity: "thinking" | "answering"): void;
+  approach?(summary: string): void;
+  requestApproval?(title: string, detail: string, approveLabel: string, signal: AbortSignal): Promise<boolean>;
   postSessions(items: Array<{ id: string; label: string }>): void;
   postHistory(id: string, items: Array<{ role: "user" | "assistant"; text: string }>): void;
 }
@@ -88,7 +99,7 @@ export class AgentController {
     await this.persist("assistant", message);
   }
 
-  async start(userPrompt: string): Promise<void> {
+  async start(userPrompt: string, approvalMode: ApprovalMode = "review"): Promise<void> {
     if (this.abortController) {
       this.ui.status(this.status, "A task is already running. Cancel it before starting another.");
       return;
@@ -113,7 +124,7 @@ export class AgentController {
       this.transition("thinking", "Collecting relevant workspace context…");
       if (!vscode.workspace.isTrusted)
         throw new Error("Mark this workspace as trusted in VS Code before using the coding agent.");
-      await this.runTask(prompt, this.abortController.signal);
+      await this.runTask(prompt, this.abortController.signal, approvalMode);
     } catch (error) {
       const message = error instanceof Error ? error.message : "The task failed unexpectedly.";
       if (this.abortController.signal.aborted || message.startsWith("Task cancelled")) {
@@ -207,7 +218,7 @@ export class AgentController {
     this.ui.postHistory(saved.id, saved.messages);
   }
 
-  private async runTask(userPrompt: string, signal: AbortSignal): Promise<void> {
+  private async runTask(userPrompt: string, signal: AbortSignal, approvalMode: ApprovalMode): Promise<void> {
     const configuration = vscode.workspace.getConfiguration("deepseekCodeAgent");
     const maxIterations = configuration.get<number>("maxIterations", 5);
     const responseLimit = configuration.get<number>("maxResponseBytes", 150_000);
@@ -280,6 +291,7 @@ export class AgentController {
         },
       );
       this.throwIfCancelled(signal);
+      this.ui.approach?.(response.plan);
       this.transition("thinking", "Preparing changes…");
       const signature = createHash("sha256").update(JSON.stringify(response)).digest("hex");
       if (responseSignatures.has(signature) && verificationMessages.length) {
@@ -296,9 +308,9 @@ export class AgentController {
         )
           throw new Error("A clarification response cannot also request context or propose changes.");
         this.transition("clarification", "Waiting for your clarification");
-        const question = `DeepSeek needs clarification: ${response.clarification}`;
-        this.ui.append("assistant", question);
-        await this.persist("assistant", question);
+        const reply = response.clarification.trim();
+        this.ui.append("assistant", reply);
+        await this.persist("assistant", reply);
         return;
       }
 
@@ -328,12 +340,24 @@ export class AgentController {
         response.verification,
       );
       if (staged.length) {
-        this.transition("waiting", `Waiting for approval · ${staged.length} proposed file change(s)`);
-        const approved = await this.previewAndApprove(staged, response.plan);
-        this.throwIfCancelled(signal);
-        if (!approved) throw new Error("Task cancelled by user before applying the proposed changes.");
-        this.transition("editing", `Applying ${staged.length} approved file change(s)…`);
-        await this.applyChanges(staged, signal);
+        const containsDeletion = staged.some((change) => change.operation.type === "delete");
+        const requiresDiffReview = shouldAskForFileApproval(approvalMode, containsDeletion);
+        if (requiresDiffReview) {
+          this.transition(
+            "waiting",
+            containsDeletion
+              ? "Waiting for approval · file changes include deletion(s)"
+              : `Waiting for approval · ${staged.length} proposed file change(s)`,
+          );
+          const approved = await this.previewAndApprove(staged, response.plan, approvalMode === "review", signal);
+          this.throwIfCancelled(signal);
+          if (!approved) throw new Error("Task cancelled by user before applying the proposed changes.");
+        }
+        this.transition(
+          "editing",
+          `Applying ${staged.length} ${approvalMode === "review" ? "approved " : ""}file change(s)…`,
+        );
+        await this.applyChanges(staged, signal, approvalMode);
         recentChanges.push(...staged.map((change) => `${change.operation.type} ${change.operation.path}`));
         await this.extensionContext.workspaceState.update("recentAgentChanges", recentChanges.slice(-40));
       }
@@ -341,13 +365,20 @@ export class AgentController {
       const commandResults: CommandResult[] = [];
       for (const command of commandsToRun) {
         this.throwIfCancelled(signal);
-        this.transition("waiting", `Waiting for approval · ${command}`);
-        const result = await this.approveAndRun(command, signal);
+        const trusted = configuration.get<string[]>("trustedCommands", []);
+        if (shouldAskForCommandApproval(command, trusted, approvalMode))
+          this.transition("waiting", `Waiting for approval · ${command}`);
+        const result = await this.approveAndRun(command, signal, approvalMode);
         if (!result) throw new Error("Task cancelled before running a proposed command.");
         commandResults.push(result);
       }
       if (!commandResults.length) {
-        const message = `Intended summary: ${response.summary}\n\n${staged.length ? `Applied ${staged.length} approved file change(s).` : "No files were changed."}\nVerification was not performed.${response.verification.length ? `\nProposed checks were not run: ${response.verification.join("; ")}` : ""}`;
+        const changeResult = staged.length
+          ? approvalMode !== "review"
+            ? `Applied ${staged.length} file change(s) in ${approvalMode === "auto-all" ? "auto-apply everything" : "safe auto"} mode.`
+            : `Applied ${staged.length} approved file change(s).`
+          : "No files were changed.";
+        const message = `Intended summary: ${response.summary}\n\n${changeResult}\nVerification was not performed.${response.verification.length ? `\nProposed checks were not run: ${response.verification.join("; ")}` : ""}`;
         this.transition("completed", "Completed · verification not performed");
         this.ui.append("assistant", message);
         await this.persist("assistant", message);
@@ -359,7 +390,12 @@ export class AgentController {
         `$ ${result.command}\nExit: ${result.exitCode === null ? "terminated" : result.exitCode}${result.timedOut ? " (timed out)" : ""}\n${result.stdout}\n${result.stderr}`.trim(),
       );
       if (!failed.length) {
-        const message = `Intended summary: ${response.summary}\n\n${staged.length ? `Applied ${staged.length} approved file change(s).` : "No files were changed."}\nVerification passed:\n${commandResults.map((item) => `- ${item.command} (exit ${item.exitCode})\n${item.stdout.slice(-1_000)}${item.stderr ? `\n${item.stderr.slice(-1_000)}` : ""}`).join("\n")}`;
+        const changeResult = staged.length
+          ? approvalMode !== "review"
+            ? `Applied ${staged.length} file change(s) in ${approvalMode === "auto-all" ? "auto-apply everything" : "safe auto"} mode.`
+            : `Applied ${staged.length} approved file change(s).`
+          : "No files were changed.";
+        const message = `Intended summary: ${response.summary}\n\n${changeResult}\nVerification passed:\n${commandResults.map((item) => `- ${item.command} (exit ${item.exitCode})\n${item.stdout.slice(-1_000)}${item.stderr ? `\n${item.stderr.slice(-1_000)}` : ""}`).join("\n")}`;
         this.transition("completed", "Completed · verification passed");
         this.ui.append("assistant", message);
         await this.persist("assistant", message);
@@ -451,7 +487,12 @@ export class AgentController {
     return staged;
   }
 
-  private async previewAndApprove(staged: StagedChange[], plan: string): Promise<boolean> {
+  private async previewAndApprove(
+    staged: StagedChange[],
+    plan: string,
+    requireApproval = true,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     for (const change of staged) {
       const original =
         change.originalDocument ??
@@ -470,25 +511,31 @@ export class AgentController {
         `${change.operation.type}: ${change.operation.path}`,
       );
     }
-    return vscode.window
-      .showWarningMessage(
-        `${plan}\n\nReview the open diffs. Apply the ${staged.length} proposed file change(s)?`,
-        { modal: true },
+    if (!requireApproval) return true;
+    if (!signal) throw new Error("An abort signal is required for file approval.");
+    return (
+      (await this.ui.requestApproval?.(
+        "Review proposed file changes",
+        `${plan}\n\nReview the open diffs. Apply ${staged.length} proposed file change(s)?`,
         "Apply changes",
-      )
-      .then((answer) => answer === "Apply changes");
+        signal,
+      )) ?? false
+    );
   }
 
-  private async applyChanges(staged: StagedChange[], signal: AbortSignal): Promise<void> {
+  private async applyChanges(staged: StagedChange[], signal: AbortSignal, approvalMode: ApprovalMode): Promise<void> {
     for (const change of staged) {
-      if (change.operation.type === "delete") {
+      if (change.operation.type === "delete" && approvalMode !== "auto-all") {
         this.transition("waiting", `Waiting for deletion approval · ${change.operation.path}`);
-        const answer = await vscode.window.showWarningMessage(
-          `Delete ${change.operation.path}? A backup will be kept in extension storage.`,
-          { modal: true },
-          "Delete file",
-        );
-        if (answer !== "Delete file")
+        const approved =
+          (await this.ui.requestApproval?.(
+            "Confirm file deletion",
+            `Delete ${change.operation.path}? A backup will be kept in extension storage.`,
+            "Delete file",
+            signal,
+          )) ?? false;
+        this.throwIfCancelled(signal);
+        if (!approved)
           throw new Error(`Task cancelled by user: deletion was not approved for ${change.operation.path}.`);
         this.transition("editing", `Deleting approved file · ${change.operation.path}`);
       }
@@ -551,19 +598,28 @@ export class AgentController {
     );
   }
 
-  private async approveAndRun(command: string, signal: AbortSignal): Promise<CommandResult | undefined> {
+  private async approveAndRun(
+    command: string,
+    signal: AbortSignal,
+    approvalMode: ApprovalMode,
+  ): Promise<CommandResult | undefined> {
     const parsed = parseSafeCommand(command);
     const trusted = vscode.workspace.getConfiguration("deepseekCodeAgent").get<string[]>("trustedCommands", []);
-    if (!isTrustedCommand(command, trusted)) {
-      const answer = await vscode.window.showWarningMessage(
-        `Run this exact command in the workspace?\n\n${command}`,
-        { modal: true },
-        "Run command",
-      );
+    if (shouldAskForCommandApproval(command, trusted, approvalMode)) {
+      const approved =
+        (await this.ui.requestApproval?.(
+          "Run proposed command?",
+          `Run this exact command in the workspace?\n\n${command}`,
+          "Run command",
+          signal,
+        )) ?? false;
       this.throwIfCancelled(signal);
-      if (answer !== "Run command") return undefined;
+      if (!approved) return undefined;
     }
-    this.transition("testing", `Running approved command: ${command}`);
+    this.transition(
+      "testing",
+      `Running ${approvalMode === "auto-all" ? "automatically approved" : "approved"} command: ${command}`,
+    );
     return runProcess(
       parsed,
       this.workspace,

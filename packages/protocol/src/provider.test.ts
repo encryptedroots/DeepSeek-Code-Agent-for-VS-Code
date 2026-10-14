@@ -119,5 +119,7 @@ describe("structured DeepSeek provider integration", () => {
       new AbortController().signal,
     );
     expect(result.clarification).toBe("Which configuration file should be changed?");
+    expect(provider.prompts[0]).toContain("Phrase it naturally as a direct conversational message");
+    expect(provider.prompts[0]).toContain("If the user only greets or makes small talk");
   });
 });

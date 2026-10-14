@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { DEFAULT_DEEPSEEK_CHAT_URL } from "@deepseek-agent/protocol";
 import { AgentController } from "./agent";
 import { BridgeServer } from "./bridgeServer";
 import { AgentViewProvider } from "./view";
@@ -7,8 +8,20 @@ let bridge: BridgeServer | undefined;
 let view: AgentViewProvider | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const port = vscode.workspace.getConfiguration("deepseekCodeAgent").get<number>("bridgePort", 43127);
-  bridge = new BridgeServer(port);
+  const configuration = vscode.workspace.getConfiguration("deepseekCodeAgent");
+  const port = configuration.get<number>("bridgePort", 43127);
+  let autoConnect = configuration.get<boolean>("autoConnect", true);
+  const storedToken = autoConnect ? await context.secrets.get("bridgeToken") : undefined;
+  const pairedToken = storedToken && /^[0-9a-f]{64}$/i.test(storedToken) ? storedToken : undefined;
+  if ((storedToken && !pairedToken) || !autoConnect) await context.secrets.delete("bridgeToken");
+  const getChatUrl = () =>
+    vscode.workspace.getConfiguration("deepseekCodeAgent").get<string>("conversationUrl", DEFAULT_DEEPSEEK_CHAT_URL);
+  bridge = new BridgeServer(port, getChatUrl, pairedToken, async (url) => {
+    await vscode.workspace
+      .getConfiguration("deepseekCodeAgent")
+      .update("conversationUrl", url, vscode.ConfigurationTarget.Global);
+    view?.conversationUrlUpdated(url);
+  });
   try {
     await bridge.start();
   } catch (error) {
@@ -42,7 +55,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("deepseekCodeAgent.clearConversation", () => view?.clearConversation()),
     vscode.commands.registerCommand("deepseekCodeAgent.newSession", () => view?.newSession()),
-    bridge.onDidPair(() => view?.paired()),
+    bridge.onDidPair((token) => {
+      if (autoConnect)
+        void Promise.resolve(context.secrets.store("bridgeToken", token)).catch((error: unknown) => {
+          console.error(
+            "[DeepSeek Code Agent] Could not save browser reconnect credentials:",
+            error instanceof Error ? error.name : "unknown error",
+          );
+        });
+      view?.paired();
+    }),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration("deepseekCodeAgent.autoConnect")) return;
+      autoConnect = vscode.workspace.getConfiguration("deepseekCodeAgent").get<boolean>("autoConnect", true);
+      const reconnectToken = bridge?.reconnectToken;
+      const update =
+        autoConnect && reconnectToken
+          ? context.secrets.store("bridgeToken", reconnectToken)
+          : context.secrets.delete("bridgeToken");
+      void Promise.resolve(update).catch((error: unknown) => {
+        console.error(
+          "[DeepSeek Code Agent] Could not update browser auto-connect preference:",
+          error instanceof Error ? error.name : "unknown error",
+        );
+      });
+    }),
     { dispose: () => view?.dispose() },
     {
       dispose: () => {

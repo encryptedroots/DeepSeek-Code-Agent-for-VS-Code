@@ -2,6 +2,7 @@
 (() => {
   // src/chatUrl.ts
   var CHAT_PATH = /^\/a\/chat\/s\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i;
+  var NEW_CHAT_PATH = /^\/$|^\/a\/chat\/s\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/?$/i;
   function validateDeepSeekChatUrl(input) {
     let url;
     try {
@@ -26,6 +27,14 @@
       return false;
     }
     return current.protocol === "https:" && current.hostname === "chat.deepseek.com" && current.origin === "https://chat.deepseek.com" && current.pathname.replace(/\/$/, "") === new URL(expected).pathname;
+  }
+  function isDeepSeekNewConversationPage(currentUrl) {
+    try {
+      const url = new URL(currentUrl);
+      return url.protocol === "https:" && url.hostname === "chat.deepseek.com" && url.origin === "https://chat.deepseek.com" && NEW_CHAT_PATH.test(url.pathname);
+    } catch {
+      return false;
+    }
   }
   function planConversationTab(tabs, configuredUrl) {
     const intended = tabs.find((tab) => tab.url && isDeepSeekConversationUrl(tab.url, configuredUrl));
@@ -60,6 +69,24 @@
   }
 
   // src/background.ts
+  async function openNewConversation(id) {
+    let error;
+    let currentRequest = true;
+    try {
+      const tab = await findOrOpenNewConversation();
+      if (tab.id === void 0) throw new Error("Could not identify a browser tab for the new conversation.");
+      await waitForConversationReady(tab.id, "https://chat.deepseek.com/", id, true, () => currentRequest);
+    } catch (failure) {
+      error = failure instanceof Error ? failure.message : "Could not open a new DeepSeek conversation.";
+    } finally {
+      currentRequest = false;
+    }
+    const response = await authorizedFetch("/new-conversation/complete", {
+      method: "POST",
+      body: JSON.stringify({ id, ok: error === void 0, ...error ? { error } : {} })
+    });
+    if (!response.ok) throw new Error(`Could not confirm the new DeepSeek conversation (${response.status}).`);
+  }
   var DEFAULT_URL = "http://127.0.0.1:43127";
   var running = false;
   var activeJob;
@@ -79,12 +106,6 @@
       signal: AbortSignal.timeout(15e3)
     });
   }
-  async function getConfiguredChatUrl() {
-    const stored = await chrome.storage.local.get("chatUrl");
-    if (typeof stored.chatUrl !== "string")
-      throw new Error("Save a DeepSeek conversation URL in the browser extension popup before starting a task.");
-    return validateDeepSeekChatUrl(stored.chatUrl);
-  }
   async function findOrOpenConversation(chatUrl) {
     const tabs = await chrome.tabs.query({ url: ["https://chat.deepseek.com/*"] });
     const plan = planConversationTab(tabs, chatUrl);
@@ -93,7 +114,15 @@
     if (plan.action === "reuse") return plan.tab;
     return chrome.tabs.update(plan.tab.id, { url: chatUrl });
   }
-  async function waitForConversationReady(tabId, chatUrl, jobId) {
+  async function findOrOpenNewConversation() {
+    const tabs = await chrome.tabs.query({ url: ["https://chat.deepseek.com/*"] });
+    const existingNewChat = tabs.find((tab) => tab.url && new URL(tab.url).pathname === "/");
+    if (existingNewChat) return existingNewChat;
+    const reusable = tabs.find((tab) => tab.active) ?? tabs[0];
+    if (reusable?.id !== void 0) return chrome.tabs.update(reusable.id, { url: "https://chat.deepseek.com/" });
+    return chrome.tabs.create({ url: "https://chat.deepseek.com/", active: true });
+  }
+  async function waitForConversationReady(tabId, chatUrl, jobId, newConversation = false, isCurrentRequest = () => activeJob?.id === jobId) {
     let currentUrl = "";
     let pageChecked = false;
     try {
@@ -102,8 +131,12 @@
           try {
             const tab = await chrome.tabs.get(tabId);
             currentUrl = tab.url ?? "";
-            if (tab.status === "complete" && isDeepSeekConversationUrl(currentUrl, chatUrl)) {
-              const page = await chrome.tabs.sendMessage(tabId, { type: "check-page", chatUrl });
+            const correctPage = newConversation ? tab.status === "complete" && isDeepSeekNewConversationPage(currentUrl) : tab.status === "complete" && isDeepSeekConversationUrl(currentUrl, chatUrl);
+            if (correctPage) {
+              const page = await chrome.tabs.sendMessage(tabId, {
+                type: newConversation ? "check-new-conversation" : "check-page",
+                chatUrl
+              });
               pageChecked = true;
               return page;
             }
@@ -113,10 +146,11 @@
         },
         (page) => page.available === true && page.intendedChat === true,
         async () => {
-          if (activeJob?.id !== jobId) throw new Error("Readiness check was cancelled.");
+          if (!isCurrentRequest()) throw new Error("Readiness check was cancelled.");
           const tab = await chrome.tabs.get(tabId);
-          if (!isDeepSeekConversationUrl(tab.url ?? "", chatUrl)) {
-            await chrome.tabs.update(tabId, { url: chatUrl });
+          const correctPage = newConversation ? isDeepSeekNewConversationPage(tab.url ?? "") : isDeepSeekConversationUrl(tab.url ?? "", chatUrl);
+          if (!correctPage) {
+            await chrome.tabs.update(tabId, { url: newConversation ? "https://chat.deepseek.com/" : chatUrl });
             return;
           }
           await chrome.tabs.reload(tabId);
@@ -124,17 +158,18 @@
         12e3,
         6e4,
         500,
-        () => activeJob?.id === jobId
+        isCurrentRequest
       );
     } catch (error) {
       if (error instanceof Error && error.message === "Readiness check was cancelled.") throw error;
-      if (!isDeepSeekConversationUrl(currentUrl, chatUrl)) {
+      const correctPage = newConversation ? isDeepSeekNewConversationPage(currentUrl) : isDeepSeekConversationUrl(currentUrl, chatUrl);
+      if (!correctPage) {
         throw new Error(
-          "Could not open the configured DeepSeek conversation after automatically retrying navigation. Check the saved URL and sign-in state."
+          newConversation ? "Could not open a new DeepSeek conversation after automatically retrying navigation. Check your sign-in state." : "Could not open the configured DeepSeek conversation after automatically retrying navigation. Check the saved URL and sign-in state."
         );
       }
       throw new Error(
-        pageChecked ? "The configured conversation is open, but its chat input is unavailable after an automatic page reload. Sign in manually or check for a DeepSeek layout change." : "The configured DeepSeek conversation did not become ready after an automatic page reload. Check your connection and sign-in state."
+        pageChecked ? newConversation ? "The new DeepSeek chat page opened, but its input is unavailable after an automatic page reload. Sign in manually or check for a DeepSeek layout change." : "The configured conversation is open, but its chat input is unavailable after an automatic page reload. Sign in manually or check for a DeepSeek layout change." : newConversation ? "The new DeepSeek chat page did not become ready after an automatic page reload. Check your connection and sign-in state." : "The configured DeepSeek conversation did not become ready after an automatic page reload. Check your connection and sign-in state."
       );
     }
   }
@@ -161,14 +196,20 @@
       if (response.status === 204) return;
       if (!response.ok) throw new Error(`Bridge request failed (${response.status}).`);
       const job = await response.json();
-      if (typeof job.id !== "string" || !/^[0-9a-f-]{36}$/i.test(job.id) || typeof job.prompt !== "string" || job.prompt.length > 4e5 || typeof job.responseLimit !== "number" || job.responseLimit < 1 || job.responseLimit > 2e5) {
+      if (job.type === "new-conversation") {
+        if (typeof job.id !== "string" || !/^[0-9a-f-]{36}$/i.test(job.id))
+          throw new Error("VS Code sent an invalid new-conversation request.");
+        await openNewConversation(job.id);
+        return;
+      }
+      if (typeof job.id !== "string" || !/^[0-9a-f-]{36}$/i.test(job.id) || typeof job.prompt !== "string" || job.prompt.length > 4e5 || typeof job.responseLimit !== "number" || job.responseLimit < 1 || job.responseLimit > 2e5 || typeof job.chatUrl !== "string" || job.newConversation !== void 0 && typeof job.newConversation !== "boolean") {
         throw new Error("VS Code sent an invalid bridge request.");
       }
       let chatUrl;
       let tab;
       try {
-        chatUrl = await getConfiguredChatUrl();
-        tab = await findOrOpenConversation(chatUrl);
+        chatUrl = validateDeepSeekChatUrl(job.chatUrl);
+        tab = job.newConversation ? await findOrOpenNewConversation() : await findOrOpenConversation(chatUrl);
         if (tab.id === void 0)
           throw new Error("Could not identify a browser tab for the configured DeepSeek conversation.");
       } catch (error) {
@@ -182,7 +223,7 @@
         if (!failed.ok) throw new Error(`Could not report invalid DeepSeek chat configuration (${failed.status}).`);
         return;
       }
-      activeJob = { id: job.id, tabId: tab.id, chatUrl };
+      activeJob = { id: job.id, tabId: tab.id, chatUrl, newConversation: job.newConversation === true };
       const cancellationWatch = setInterval(() => {
         void authorizedFetch(`/cancelled?id=${encodeURIComponent(job.id)}`).then(async (cancelResponse) => {
           if (cancelResponse.ok && (await cancelResponse.json()).cancelled) {
@@ -193,19 +234,23 @@
       }, 800);
       let result;
       try {
-        await waitForConversationReady(tab.id, chatUrl, job.id);
+        await waitForConversationReady(tab.id, chatUrl, job.id, job.newConversation === true);
         if (activeJob?.id !== job.id) throw new Error("The DeepSeek request was interrupted before prompt submission.");
         const text = await chrome.tabs.sendMessage(tab.id, {
           type: "run-prompt",
           prompt: job.prompt,
           chatUrl,
+          newConversation: job.newConversation === true,
           timeoutMs: 18e4
         });
         if (!text?.ok)
           throw new Error(typeof text?.error === "string" ? text.error : "DeepSeek page integration failed.");
         if (typeof text.response !== "string" || !text.response.trim())
           throw new Error("DeepSeek returned an empty response.");
-        result = new TextEncoder().encode(text.response).byteLength > job.responseLimit ? { error: "DeepSeek response exceeded the configured response size limit; no partial response was used." } : { response: text.response };
+        result = new TextEncoder().encode(text.response).byteLength > job.responseLimit ? { error: "DeepSeek response exceeded the configured response size limit; no partial response was used." } : {
+          response: text.response,
+          ...typeof text.conversationUrl === "string" ? { conversationUrl: validateDeepSeekChatUrl(text.conversationUrl) } : {}
+        };
       } catch (error) {
         result = { error: error instanceof Error ? error.message : "DeepSeek request failed." };
       } finally {
@@ -236,12 +281,25 @@
     if (activeJob?.tabId === tabId) failActiveJob("The authenticated DeepSeek chat tab was closed.");
   });
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (activeJob?.tabId === tabId && changeInfo.url && !isDeepSeekConversationUrl(changeInfo.url, activeJob.chatUrl)) {
+    const validLocation = activeJob?.newConversation && changeInfo.url ? isDeepSeekNewConversationPage(changeInfo.url) : changeInfo.url && activeJob ? isDeepSeekConversationUrl(changeInfo.url, activeJob.chatUrl) : true;
+    if (activeJob?.tabId === tabId && changeInfo.url && !validLocation) {
       failActiveJob("The DeepSeek tab navigated away from the configured conversation.");
       void chrome.tabs.sendMessage(tabId, { type: "cancel-prompt" }).catch(() => void 0);
     }
   });
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "thinking-state" && activeJob && (message.activity === "thinking" || message.activity === "answering") && _sender.tab?.id === activeJob.tabId) {
+      void authorizedFetch("/activity", {
+        method: "POST",
+        body: JSON.stringify({ id: activeJob.id, activity: message.activity })
+      }).catch(
+        (error) => console.warn(
+          "[DeepSeek Code Agent] Could not forward DeepSeek activity:",
+          error instanceof Error ? error.message : "unknown error"
+        )
+      );
+      return false;
+    }
     if (message?.type === "pair") {
       const baseUrl = typeof message.baseUrl === "string" ? message.baseUrl.replace(/\/+$/, "") : DEFAULT_URL;
       const code = typeof message.code === "string" ? message.code.trim() : "";
@@ -277,8 +335,16 @@
       return true;
     }
     if (message?.type === "health") {
-      void Promise.all([authorizedFetch("/health"), getConfiguredChatUrl()]).then(async ([response, chatUrl]) => {
+      void authorizedFetch("/health").then(async (response) => {
         const bridgeState = await response.json();
+        if (typeof bridgeState.chatUrl !== "string") {
+          sendResponse({
+            ok: false,
+            message: "Configure a valid DeepSeek conversation URL in VS Code settings first."
+          });
+          return;
+        }
+        const chatUrl = validateDeepSeekChatUrl(bridgeState.chatUrl);
         const tabs = await chrome.tabs.query({ url: ["https://chat.deepseek.com/*"] });
         const tab = tabs.find((candidate) => candidate.url && isDeepSeekConversationUrl(candidate.url, chatUrl));
         const page = response.ok && tab?.id !== void 0 ? await chrome.tabs.sendMessage(tab.id, { type: "check-page", chatUrl }).catch(() => void 0) : void 0;

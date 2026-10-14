@@ -14,8 +14,20 @@ const cancel = document.querySelector<HTMLButtonElement>("#cancel")!;
 const retry = document.querySelector<HTMLButtonElement>("#retry")!;
 const reviewChanges = document.querySelector<HTMLButtonElement>("#review-changes")!;
 const composer = document.querySelector<HTMLFormElement>("#composer")!;
+const approvalMode = document.querySelector<HTMLSelectElement>("#approval-mode")!;
+const approvalRequest = document.querySelector<HTMLElement>("#approval-request")!;
+const approvalTitle = document.querySelector<HTMLElement>("#approval-title")!;
+const approvalDetail = document.querySelector<HTMLElement>("#approval-detail")!;
+const approvalApprove = document.querySelector<HTMLButtonElement>("#approval-approve")!;
+const approvalReject = document.querySelector<HTMLButtonElement>("#approval-reject")!;
+const conversationUrlForm = document.querySelector<HTMLFormElement>("#conversation-url-form")!;
+const conversationUrlInput = document.querySelector<HTMLInputElement>("#conversation-url")!;
+const conversationUrlState = document.querySelector<HTMLElement>("#conversation-url-state")!;
+const saveConversationUrl = document.querySelector<HTMLButtonElement>("#save-conversation-url")!;
+const connectionMode = document.querySelector<HTMLSelectElement>("#connection-mode")!;
 let thinkingPanel: HTMLDetailsElement | undefined;
 let lastPrompt = "";
+let pendingApprovalId: string | undefined;
 
 function inlineText(parent: HTMLElement, text: string): void {
   const inlineCode = /`([^`]+)`/g;
@@ -71,14 +83,15 @@ function renderBody(body: HTMLElement, text: string): void {
 function addMessage(role: string, text: string): void {
   const article = document.createElement("article");
   const isError = role === "assistant" && text.startsWith("Task failed:");
-  const isQuestion = role === "assistant" && text.startsWith("DeepSeek needs clarification:");
+  const displayText = text.replace(/^DeepSeek needs clarification:\s*/i, "");
+  const isQuestion = role === "assistant" && displayText !== text;
   article.className = `message ${role}${isError ? " error-message" : ""}${isQuestion ? " question-message" : ""}`;
   const label = document.createElement("div");
   label.className = "message-label";
   label.textContent = role === "user" ? "You" : isError ? "Task error" : isQuestion ? "Clarification" : "Agent";
   const body = document.createElement("div");
   body.className = "message-body";
-  renderBody(body, text);
+  renderBody(body, displayText);
   article.append(label, body);
   messages.append(article);
   emptyState.hidden = true;
@@ -93,6 +106,40 @@ function appendThinkingStep(text: string): void {
   step.className = "thinking-step";
   step.textContent = text;
   steps.append(step);
+}
+
+function setDeepSeekActivity(activity: "thinking" | "answering"): void {
+  if (!thinkingPanel) return;
+  const title = thinkingPanel.querySelector<HTMLElement>(".thinking-title")!;
+  title.dataset.activity = activity;
+  title.replaceChildren(document.createTextNode(activity === "thinking" ? "Thinking" : "Responding"));
+  if (activity === "thinking") {
+    const dots = document.createElement("span");
+    dots.className = "thinking-dots";
+    dots.setAttribute("aria-hidden", "true");
+    for (let index = 0; index < 3; index += 1) {
+      const dot = document.createElement("span");
+      dot.textContent = ".";
+      dots.append(dot);
+    }
+    title.append(dots);
+  }
+  appendThinkingStep(activity === "thinking" ? "DeepSeek is thinking…" : "DeepSeek is writing its answer…");
+}
+
+function setThinkingLabel(label: HTMLElement, text: string, animate: boolean): void {
+  label.replaceChildren(document.createTextNode(text));
+  label.dataset.activity = animate ? "thinking" : "";
+  if (!animate) return;
+  const dots = document.createElement("span");
+  dots.className = "thinking-dots";
+  dots.setAttribute("aria-hidden", "true");
+  for (let index = 0; index < 3; index += 1) {
+    const dot = document.createElement("span");
+    dot.textContent = ".";
+    dots.append(dot);
+  }
+  label.append(dots);
 }
 
 function statusText(value: string, message: string): string {
@@ -111,7 +158,7 @@ function submitPrompt(): void {
   const active = !["completed", "failed", "cancelled", "clarification"].includes(status.dataset.state ?? "completed");
   if (!text || active) return;
   lastPrompt = text;
-  vscode.postMessage({ type: "send", text });
+  vscode.postMessage({ type: "send", text, approvalMode: approvalMode.value });
   prompt.value = "";
   prompt.style.height = "";
   send.disabled = true;
@@ -140,6 +187,9 @@ prompt.addEventListener("input", () => {
 cancel.addEventListener("click", () => vscode.postMessage({ type: "cancel" }));
 reviewChanges.addEventListener("click", () => {
   if (proposal.hidden) return;
+  const expanded = proposal.classList.toggle("expanded");
+  reviewChanges.setAttribute("aria-expanded", String(expanded));
+  reviewChanges.title = expanded ? "Collapse proposed changes" : "Review proposed changes";
   proposal.scrollIntoView({ behavior: "auto", block: "nearest" });
   proposal.focus();
 });
@@ -149,14 +199,52 @@ retry.addEventListener("click", () => {
 });
 document.querySelector("#clear")!.addEventListener("click", () => vscode.postMessage({ type: "clear" }));
 document.querySelector("#new-session")!.addEventListener("click", () => vscode.postMessage({ type: "new-session" }));
-document.querySelector<HTMLSelectElement>("#sessions")!.addEventListener("change", (event) => {
-  vscode.postMessage({ type: "open-session", text: (event.target as HTMLSelectElement).value });
+conversationUrlForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!conversationUrlForm.reportValidity()) return;
+  saveConversationUrl.disabled = true;
+  conversationUrlState.textContent = "Validating and saving…";
+  conversationUrlState.dataset.state = "pending";
+  vscode.postMessage({ type: "save-conversation-url", text: conversationUrlInput.value.trim() });
 });
+
+conversationUrlInput.addEventListener("input", () => {
+  conversationUrlState.textContent = "Unsaved changes";
+  conversationUrlState.dataset.state = "unsaved";
+});
+
+connectionMode.addEventListener("change", () => {
+  connectionMode.disabled = true;
+  connectionMode.title = "Saving browser reconnection preference…";
+  vscode.postMessage({ type: "save-auto-connect", enabled: connectionMode.value === "auto" });
+});
+
+function answerApproval(approved: boolean): void {
+  if (!pendingApprovalId) return;
+  vscode.postMessage({ type: "approval-response", approvalId: pendingApprovalId, approved });
+  pendingApprovalId = undefined;
+  approvalRequest.hidden = true;
+  approvalApprove.disabled = false;
+  approvalReject.disabled = false;
+}
+
+approvalApprove.addEventListener("click", () => answerApproval(true));
+approvalReject.addEventListener("click", () => answerApproval(false));
 
 window.addEventListener("message", (event: MessageEvent) => {
   const message = event.data as Record<string, unknown>;
   if (message.type === "initialize") {
     document.querySelector("#workspace")!.textContent = String(message.workspace);
+    if (typeof message.conversationUrl === "string") {
+      conversationUrlInput.value = message.conversationUrl;
+      conversationUrlState.textContent = "Using this conversation for new tasks.";
+      conversationUrlState.dataset.state = "saved";
+    }
+    connectionMode.value = message.autoConnect === false ? "manual" : "auto";
+    connectionMode.title =
+      connectionMode.value === "auto"
+        ? "Reconnect automatically after the first pairing."
+        : "Pair with the browser extension again after VS Code restarts.";
     connection.hidden = false;
     if (typeof message.pairingCode === "string") {
       connection.textContent = `Pair the browser extension at http://127.0.0.1:${String(message.port)} using code ${message.pairingCode}. Chat readiness is checked separately.`;
@@ -164,8 +252,8 @@ window.addEventListener("message", (event: MessageEvent) => {
     } else if (message.bridgePaired === true) {
       connection.textContent =
         message.browserActive === true
-          ? "Browser paired and polling · open its popup to inspect and confirm the intended conversation."
-          : "Browser paired · open its popup to inspect and confirm the intended conversation.";
+          ? "Browser paired and polling."
+          : "Browser paired · waiting for the browser extension to reconnect.";
       connection.dataset.state = "paired";
     } else {
       connection.textContent = "Browser extension is not paired.";
@@ -173,16 +261,51 @@ window.addEventListener("message", (event: MessageEvent) => {
     }
     return;
   }
+  if (message.type === "conversation-url-saved") {
+    saveConversationUrl.disabled = false;
+    if (message.ok === true && typeof message.url === "string") {
+      conversationUrlInput.value = message.url;
+      conversationUrlState.textContent = "Saved. New tasks will use this conversation.";
+      conversationUrlState.dataset.state = "saved";
+    } else {
+      conversationUrlState.textContent = String(message.message ?? "Could not save the conversation URL.");
+      conversationUrlState.dataset.state = "error";
+    }
+    return;
+  }
+  if (message.type === "conversation-url-updated" && typeof message.url === "string") {
+    conversationUrlInput.value = message.url;
+    conversationUrlState.textContent = "New DeepSeek conversation selected.";
+    conversationUrlState.dataset.state = "saved";
+    return;
+  }
+  if (message.type === "auto-connect-saved") {
+    connectionMode.disabled = false;
+    if (message.ok === true) {
+      connectionMode.value = message.enabled === true ? "auto" : "manual";
+      connectionMode.title =
+        message.enabled === true
+          ? "Reconnect automatically after the first pairing."
+          : "Pair with the browser extension again after VS Code restarts.";
+    } else {
+      connectionMode.value = message.enabled === true ? "manual" : "auto";
+      connectionMode.title = String(message.message ?? "Could not save the connection preference.");
+      status.textContent = connectionMode.title;
+      status.dataset.state = "failed";
+    }
+    return;
+  }
   if (message.type === "paired") {
     connection.hidden = false;
     connection.dataset.state = "paired";
-    connection.textContent = "Browser extension paired · inspect and confirm the intended conversation in its popup.";
+    connection.textContent = "Browser extension paired and ready.";
     return;
   }
   if (message.type === "status") {
     const value = String(message.status);
     const currentMessage = String(message.message);
     status.dataset.state = value;
+    if (thinkingPanel) thinkingPanel.dataset.state = value;
     status.textContent = statusText(value, currentMessage);
     const active = !["completed", "failed", "cancelled", "clarification"].includes(value);
     if (active) {
@@ -203,6 +326,7 @@ window.addEventListener("message", (event: MessageEvent) => {
         messages.append(thinkingPanel);
         emptyState.hidden = true;
       }
+      thinkingPanel.dataset.state = value;
       const title = thinkingPanel.querySelector<HTMLElement>(".thinking-title")!;
       title.textContent =
         value === "thinking"
@@ -215,6 +339,7 @@ window.addEventListener("message", (event: MessageEvent) => {
                 ? "Verifying"
                 : "Working";
       thinkingPanel.dataset.active = "true";
+      setThinkingLabel(title, value === "thinking" ? "Thinking" : (title.textContent ?? ""), value === "thinking");
       appendThinkingStep(currentMessage);
       messages.scrollTop = messages.scrollHeight;
     } else if (thinkingPanel) {
@@ -228,13 +353,14 @@ window.addEventListener("message", (event: MessageEvent) => {
               : "Waiting for your clarification";
       appendThinkingStep(terminalStep);
       thinkingPanel.dataset.active = "false";
+      thinkingPanel.dataset.state = value;
       thinkingPanel.querySelector<HTMLElement>(".thinking-title")!.textContent = "Task progress";
       thinkingPanel.open = false;
       thinkingPanel = undefined;
     }
     cancel.hidden = !active;
     retry.hidden = value !== "failed" || !lastPrompt;
-    reviewChanges.hidden = proposal.hidden || !["waiting", "editing", "testing"].includes(value);
+    reviewChanges.hidden = proposal.hidden;
     send.disabled = active || !prompt.value.trim();
     return;
   }
@@ -246,28 +372,41 @@ window.addEventListener("message", (event: MessageEvent) => {
   if (message.type === "stream") {
     return;
   }
+  if (message.type === "activity" && (message.activity === "thinking" || message.activity === "answering")) {
+    setDeepSeekActivity(message.activity);
+    return;
+  }
+  if (message.type === "approval-prompt") {
+    pendingApprovalId = String(message.id);
+    approvalTitle.textContent = String(message.title);
+    approvalDetail.textContent = String(message.detail);
+    approvalApprove.textContent = String(message.approveLabel);
+    approvalApprove.disabled = false;
+    approvalReject.disabled = false;
+    approvalRequest.hidden = false;
+    approvalRequest.scrollIntoView({ behavior: "auto", block: "nearest" });
+    approvalApprove.focus();
+    return;
+  }
+  if (message.type === "approval-clear" && message.id === pendingApprovalId) {
+    pendingApprovalId = undefined;
+    approvalRequest.hidden = true;
+    approvalApprove.disabled = false;
+    approvalReject.disabled = false;
+    return;
+  }
+  if (message.type === "approach" && typeof message.summary === "string" && thinkingPanel) {
+    appendThinkingStep(`Approach: ${message.summary}`);
+    return;
+  }
   if (message.type === "clear") {
     messages.querySelectorAll(".message, .streaming, .thinking-panel").forEach((item) => item.remove());
     thinkingPanel = undefined;
     emptyState.hidden = false;
     proposal.hidden = true;
-    document.querySelector<HTMLSelectElement>("#sessions")!.value = "current";
-    return;
-  }
-  if (message.type === "sessions") {
-    const select = document.querySelector<HTMLSelectElement>("#sessions")!;
-    const active = select.value;
-    select.replaceChildren(new Option("Current conversation", "current"));
-    if (Array.isArray(message.items)) {
-      for (const item of message.items as Array<{ id: string; label: string }>) {
-        select.add(new Option(item.label, item.id));
-      }
-    }
-    select.value = [...select.options].some((option) => option.value === active) ? active : "current";
     return;
   }
   if (message.type === "show-history") {
-    document.querySelector<HTMLSelectElement>("#sessions")!.value = String(message.sessionId);
     messages.querySelectorAll(".message, .streaming, .thinking-panel").forEach((item) => item.remove());
     thinkingPanel = undefined;
     if (Array.isArray(message.items)) {
@@ -284,9 +423,15 @@ window.addEventListener("message", (event: MessageEvent) => {
     if (!plan && !changes.length && !commands.length) {
       proposal.hidden = true;
       reviewChanges.hidden = true;
+      proposal.classList.remove("expanded");
+      reviewChanges.setAttribute("aria-expanded", "false");
+      reviewChanges.title = "Review proposed changes";
       return;
     }
     proposal.hidden = false;
+    proposal.classList.remove("expanded");
+    reviewChanges.setAttribute("aria-expanded", "false");
+    reviewChanges.title = "Review proposed changes";
     reviewChanges.hidden = false;
     const heading = document.createElement("h2");
     heading.textContent = "Proposed work";
