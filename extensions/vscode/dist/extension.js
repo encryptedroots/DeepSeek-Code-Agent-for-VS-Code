@@ -6,7 +6,11 @@ var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __commonJS = (cb, mod) => function __require() {
-  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  try {
+    return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  } catch (e) {
+    throw mod = 0, e;
+  }
 };
 var __export = (target, all) => {
   for (var name in all)
@@ -3897,7 +3901,7 @@ var require_types = __commonJS({
         ...processCreateParams(params)
       });
     };
-    exports2.BRAND = Symbol("zod_brand");
+    exports2.BRAND = /* @__PURE__ */ Symbol("zod_brand");
     var ZodBranded = class extends ZodType {
       _parse(input) {
         const { ctx } = this._processInputParams(input);
@@ -4144,14 +4148,14 @@ var require_types = __commonJS({
     var oboolean = () => booleanType().optional();
     exports2.oboolean = oboolean;
     exports2.coerce = {
-      string: (arg) => ZodString.create({ ...arg, coerce: true }),
-      number: (arg) => ZodNumber.create({ ...arg, coerce: true }),
-      boolean: (arg) => ZodBoolean.create({
+      string: ((arg) => ZodString.create({ ...arg, coerce: true })),
+      number: ((arg) => ZodNumber.create({ ...arg, coerce: true })),
+      boolean: ((arg) => ZodBoolean.create({
         ...arg,
         coerce: true
-      }),
-      bigint: (arg) => ZodBigInt.create({ ...arg, coerce: true }),
-      date: (arg) => ZodDate.create({ ...arg, coerce: true })
+      })),
+      bigint: ((arg) => ZodBigInt.create({ ...arg, coerce: true })),
+      date: ((arg) => ZodDate.create({ ...arg, coerce: true }))
     };
     exports2.NEVER = parseUtil_1.INVALID;
   }
@@ -4161,7 +4165,7 @@ var require_types = __commonJS({
 var require_external = __commonJS({
   "../../node_modules/zod/lib/external.js"(exports2) {
     "use strict";
-    var __createBinding = exports2 && exports2.__createBinding || (Object.create ? function(o, m, k, k2) {
+    var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m, k, k2) {
       if (k2 === void 0) k2 = k;
       var desc = Object.getOwnPropertyDescriptor(m, k);
       if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
@@ -4170,10 +4174,10 @@ var require_external = __commonJS({
         } };
       }
       Object.defineProperty(o, k2, desc);
-    } : function(o, m, k, k2) {
+    }) : (function(o, m, k, k2) {
       if (k2 === void 0) k2 = k;
       o[k2] = m[k];
-    });
+    }));
     var __exportStar = exports2 && exports2.__exportStar || function(m, exports3) {
       for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports3, p)) __createBinding(exports3, m, p);
     };
@@ -4191,7 +4195,7 @@ var require_external = __commonJS({
 var require_lib = __commonJS({
   "../../node_modules/zod/lib/index.js"(exports2) {
     "use strict";
-    var __createBinding = exports2 && exports2.__createBinding || (Object.create ? function(o, m, k, k2) {
+    var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m, k, k2) {
       if (k2 === void 0) k2 = k;
       var desc = Object.getOwnPropertyDescriptor(m, k);
       if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
@@ -4200,13 +4204,13 @@ var require_lib = __commonJS({
         } };
       }
       Object.defineProperty(o, k2, desc);
-    } : function(o, m, k, k2) {
+    }) : (function(o, m, k, k2) {
       if (k2 === void 0) k2 = k;
       o[k2] = m[k];
-    });
-    var __setModuleDefault = exports2 && exports2.__setModuleDefault || (Object.create ? function(o, v) {
+    }));
+    var __setModuleDefault = exports2 && exports2.__setModuleDefault || (Object.create ? (function(o, v) {
       Object.defineProperty(o, "default", { enumerable: true, value: v });
-    } : function(o, v) {
+    }) : function(o, v) {
       o["default"] = v;
     });
     var __importStar = exports2 && exports2.__importStar || function(mod) {
@@ -4715,6 +4719,7 @@ var ContextCollector = class {
   constructor(workspace5) {
     this.workspace = workspace5;
   }
+  workspace;
   async collectOverviewInventory(limit) {
     const config = vscode.workspace.getConfiguration("deepseekCodeAgent");
     const customExcludes = config.get("excludedGlobs", []);
@@ -5256,6 +5261,10 @@ var AgentController = class {
     this.provider = provider;
     this.ui = ui;
   }
+  extensionContext;
+  workspace;
+  provider;
+  ui;
   taskState = new TaskState();
   abortController;
   failedCommands = /* @__PURE__ */ new Set();
@@ -6063,6 +6072,10 @@ var BridgeServer = class {
     this.pairedExtensionOrigin = pairedExtensionOrigin;
     this.pairingCode = pairedToken === void 0 ? String((0, import_node_crypto3.randomInt)(1e7, 1e8)) : "";
   }
+  port;
+  getChatUrl;
+  onConversationUrl;
+  getAutoConnect;
   server;
   token;
   pairingCode;
@@ -6558,6 +6571,9 @@ var AgentViewProvider = class {
     this.context = context;
     this.bridge = bridge2;
   }
+  extensionUri;
+  context;
+  bridge;
   view;
   controller;
   restored = false;
