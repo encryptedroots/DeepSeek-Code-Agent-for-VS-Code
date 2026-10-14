@@ -1,7 +1,16 @@
 import * as vscode from "vscode";
 import { createHash } from "node:crypto";
 import { isSafeRelativePath, redactSecrets } from "./safety";
-import { rankWorkspacePaths, relevantExcerpt, taskTerms, truncateUtf8 } from "./contextRanking";
+import {
+  buildOverviewInventoryText,
+  buildOverviewFileBatches,
+  isOverviewInventoryPath,
+  rankWorkspacePaths,
+  relevantExcerpt,
+  taskTerms,
+  truncateUtf8,
+  type OverviewSourceFile,
+} from "./contextRanking";
 export { isSafeRelativePath, redactSecrets } from "./safety";
 
 const DEFAULT_EXCLUDES = [
@@ -42,6 +51,26 @@ export interface CollectedContext {
   contentHashes: Map<string, string>;
   fullFiles: Set<string>;
   headerHash: string;
+  fileRequestStatuses: Map<string, "included" | "previously included" | "unavailable" | "too large" | "over budget">;
+}
+
+export interface OverviewInventory {
+  paths: string[];
+  discoveredFileCount: number;
+  discoveryTruncated: boolean;
+  text: string;
+  listedPaths: string[];
+  omittedCount: number;
+}
+
+export interface CollectedOverviewFiles {
+  batches: Array<{ text: string; completedPaths: string[] }>;
+  deliveredPaths: string[];
+  unavailablePaths: string[];
+  tooLargePaths: string[];
+  overBudgetPaths: string[];
+  deferredPaths: string[];
+  bytesRead: number;
 }
 
 interface GitRepository {
@@ -56,6 +85,137 @@ interface GitExtensionExports {
 
 export class ContextCollector {
   constructor(private readonly workspace: vscode.WorkspaceFolder) {}
+
+  async collectOverviewInventory(limit: number): Promise<OverviewInventory> {
+    const config = vscode.workspace.getConfiguration("deepseekCodeAgent");
+    const customExcludes = config.get<string[]>("excludedGlobs", []);
+    const excludePattern = `{${[...DEFAULT_EXCLUDES, ...customExcludes].join(",")}}`;
+    const allFiles = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(this.workspace, "**/*"),
+      excludePattern,
+      2000,
+    );
+    const discovered = allFiles.map((uri) => ({
+      uri,
+      path: vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"),
+    }));
+    const inventoryPaths = discovered
+      .map(({ path }) => path)
+      .filter(isOverviewInventoryPath)
+      .sort((left, right) => left.localeCompare(right));
+    const inventory = buildOverviewInventoryText(
+      this.workspace.name,
+      inventoryPaths,
+      Math.max(1, Math.floor(limit * 0.8)),
+    );
+    return {
+      paths: inventoryPaths,
+      discoveredFileCount: discovered.length,
+      discoveryTruncated: discovered.length === 2000,
+      text: inventory.text,
+      listedPaths: inventory.includedPaths,
+      omittedCount: inventory.omittedCount,
+    };
+  }
+
+  async collectOverviewFiles(
+    requestedPaths: string[],
+    limit: number,
+    signal: AbortSignal,
+    maxFiles = 10,
+    remainingReadBudget = 300_000,
+  ): Promise<CollectedOverviewFiles> {
+    const config = vscode.workspace.getConfiguration("deepseekCodeAgent");
+    const customExcludes = config.get<string[]>("excludedGlobs", []);
+    const excludePattern = `{${[...DEFAULT_EXCLUDES, ...customExcludes].join(",")}}`;
+    const allFiles = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(this.workspace, "**/*"),
+      excludePattern,
+      2000,
+    );
+    const availablePaths = new Set(
+      allFiles
+        .map((uri) => vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"))
+        .filter(isOverviewInventoryPath),
+    );
+    const uniquePaths = [...new Set(requestedPaths)];
+    const selectedPaths = uniquePaths.slice(0, maxFiles);
+    const result: CollectedOverviewFiles = {
+      batches: [],
+      deliveredPaths: [],
+      unavailablePaths: uniquePaths.filter((path) => !availablePaths.has(path)),
+      tooLargePaths: [],
+      overBudgetPaths: [],
+      deferredPaths: uniquePaths.slice(maxFiles),
+      bytesRead: 0,
+    };
+    const sourceFiles: OverviewSourceFile[] = [];
+    let bytesUsed = 0;
+    for (const path of selectedPaths) {
+      if (signal.aborted) throw new Error("Task cancelled while reading requested workspace files.");
+      if (!availablePaths.has(path)) continue;
+      let safeUri: vscode.Uri;
+      try {
+        safeUri = await this.resolveSafePath(path);
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Symbolic links are not allowed")) {
+          result.unavailablePaths.push(path);
+          continue;
+        }
+        throw error;
+      }
+      let stat: vscode.FileStat;
+      try {
+        stat = await vscode.workspace.fs.stat(safeUri);
+      } catch (error) {
+        if (error instanceof vscode.FileSystemError && error.code === "FileNotFound") {
+          result.unavailablePaths.push(path);
+          continue;
+        }
+        throw error;
+      }
+      if ((stat.type & vscode.FileType.Directory) !== 0 || stat.size > 1_000_000) {
+        result.tooLargePaths.push(path);
+        continue;
+      }
+      if (stat.size > remainingReadBudget - bytesUsed) {
+        result.overBudgetPaths.push(path);
+        continue;
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = await vscode.workspace.fs.readFile(safeUri);
+      } catch (error) {
+        if (error instanceof vscode.FileSystemError && error.code === "FileNotFound") {
+          result.unavailablePaths.push(path);
+          continue;
+        }
+        throw error;
+      }
+      if (bytes.byteLength > remainingReadBudget - bytesUsed) {
+        result.overBudgetPaths.push(path);
+        continue;
+      }
+      if (bytes.subarray(0, Math.min(bytes.length, 8_000)).includes(0)) {
+        result.unavailablePaths.push(path);
+        continue;
+      }
+      let content: string;
+      try {
+        content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        result.unavailablePaths.push(path);
+        continue;
+      }
+      const file = { path, content: redactSecrets(content) };
+      sourceFiles.push(file);
+      result.deliveredPaths.push(path);
+      bytesUsed += bytes.byteLength;
+    }
+    result.bytesRead = bytesUsed;
+    result.batches = buildOverviewFileBatches(sourceFiles, Math.max(1, Math.floor(limit * 0.75)));
+    return result;
+  }
 
   async collect(
     prompt: string,
@@ -128,13 +288,19 @@ export class ContextCollector {
     const seenContentHashes = new Set<string>();
     const contentHashes = new Map<string, string>();
     const fullFiles = new Set<string>();
+    const fileRequestStatuses = new Map<
+      string,
+      "included" | "previously included" | "unavailable" | "too large" | "over budget"
+    >();
+    for (const path of explicitFiles) {
+      if (!relative.includes(path)) fileRequestStatuses.set(path, "unavailable");
+    }
     for (const path of selected) {
       if (!relative.includes(path)) continue;
       const uri = vscode.Uri.joinPath(this.workspace.uri, ...path.split("/"));
       const bytes = await vscode.workspace.fs.readFile(uri);
-      if (bytes.length > 100_000) continue;
-      const content = redactSecrets(new TextDecoder("utf-8", { fatal: false }).decode(bytes));
       const isExplicit = explicitFiles.includes(path);
+      const content = redactSecrets(new TextDecoder("utf-8", { fatal: false }).decode(bytes));
       const isFull = isExplicit || bytes.length <= 6_000;
       const contentHash = createHash("sha256").update(content).digest("hex");
       const fileHash = createHash("sha256").update(bytes).digest("hex");
@@ -144,6 +310,7 @@ export class ContextCollector {
           fullFiles.add(path);
           includedFiles.push(path);
           fingerprints.set(path, fileHash);
+          if (isExplicit) fileRequestStatuses.set(path, "previously included");
           continue;
         }
         if (!isExplicit) continue;
@@ -151,7 +318,10 @@ export class ContextCollector {
       if (!isExplicit && seenContentHashes.has(contentHash)) continue;
       const excerpt = isFull ? content : relevantExcerpt(content, prompt, 5_000);
       const block = `\n--- ${path}${isFull ? "" : " (relevant excerpt)"} ---\n${excerpt}`;
-      if (Buffer.byteLength(`${text}${block}`, "utf8") > limit) break;
+      if (Buffer.byteLength(`${text}${block}`, "utf8") > limit) {
+        if (isExplicit) fileRequestStatuses.set(path, "over budget");
+        break;
+      }
       text += block;
       seenContentHashes.add(contentHash);
       contentHashes.set(path, fileHash);
@@ -159,9 +329,13 @@ export class ContextCollector {
         includedFiles.push(path);
         fingerprints.set(path, fileHash);
         fullFiles.add(path);
+        if (isExplicit) fileRequestStatuses.set(path, "included");
       }
     }
-    return { text, files: includedFiles, fingerprints, contentHashes, fullFiles, headerHash };
+    for (const path of explicitFiles) {
+      if (!fileRequestStatuses.has(path)) fileRequestStatuses.set(path, "over budget");
+    }
+    return { text, files: includedFiles, fingerprints, contentHashes, fullFiles, headerHash, fileRequestStatuses };
   }
 
   private async gitContext(task: string, activePath?: string): Promise<string> {

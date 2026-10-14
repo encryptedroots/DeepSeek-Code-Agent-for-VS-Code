@@ -5,7 +5,6 @@ import {
   bridgeProgressSchema,
   bridgeResultSchema,
   bridgeJobSchema,
-  DEFAULT_DEEPSEEK_CHAT_URL,
   validateDeepSeekChatUrl,
 } from "@deepseek-agent/protocol";
 
@@ -27,7 +26,9 @@ export class BridgeServer {
   private pairingAttempts = 0;
   private paired: boolean;
   private lastBrowserPoll = 0;
-  private readonly pairListeners = new Set<(token: string) => void>();
+  private readonly pairListeners = new Set<(token: string, origin: string) => void>();
+  private readonly pairingWaiters = new Set<(error?: Error) => void>();
+  private pairedExtensionOrigin: string | undefined;
   private readonly queue: Array<{
     id: string;
     prompt: string;
@@ -48,12 +49,15 @@ export class BridgeServer {
 
   constructor(
     private readonly port: number,
-    private readonly getChatUrl: () => string = () => DEFAULT_DEEPSEEK_CHAT_URL,
+    private readonly getChatUrl: () => string = () => "",
     pairedToken?: string,
     private readonly onConversationUrl?: (url: string) => Promise<void>,
+    private readonly getAutoConnect: () => boolean = () => false,
+    pairedExtensionOrigin?: string,
   ) {
     this.token = pairedToken ?? randomBytes(32).toString("hex");
     this.paired = pairedToken !== undefined;
+    this.pairedExtensionOrigin = pairedExtensionOrigin;
     this.pairingCode = pairedToken === undefined ? String(randomInt(10_000_000, 100_000_000)) : "";
   }
 
@@ -75,11 +79,15 @@ export class BridgeServer {
     return this.paired ? this.token : undefined;
   }
 
+  get reconnectOrigin(): string | undefined {
+    return this.paired ? this.pairedExtensionOrigin : undefined;
+  }
+
   get browserActive(): boolean {
     return this.paired && Date.now() - this.lastBrowserPoll < 90_000;
   }
 
-  onDidPair(listener: (token: string) => void): { dispose: () => void } {
+  onDidPair(listener: (token: string, origin: string) => void): { dispose: () => void } {
     this.pairListeners.add(listener);
     return { dispose: () => this.pairListeners.delete(listener) };
   }
@@ -110,6 +118,7 @@ export class BridgeServer {
   async stop(): Promise<void> {
     for (const request of this.pending.values()) request.reject(new Error("The browser bridge was stopped."));
     this.pending.clear();
+    for (const waiter of this.pairingWaiters) waiter(new Error("The browser bridge was stopped."));
     for (const pending of this.pendingNewConversations.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("The browser bridge was stopped."));
@@ -134,6 +143,11 @@ export class BridgeServer {
       return Promise.reject(new Error("Prompt exceeds the 400 KB browser-bridge limit."));
     if (!Number.isInteger(responseLimit) || responseLimit < 1 || responseLimit > 200_000) {
       return Promise.reject(new Error("Configured response size is outside the supported limit."));
+    }
+    if (!this.paired && this.getAutoConnect()) {
+      return this.waitForAutomaticPairing(signal).then(() =>
+        this.request(prompt, responseLimit, signal, onProgress, onActivity),
+      );
     }
     if (!this.paired)
       return Promise.reject(
@@ -199,6 +213,40 @@ export class BridgeServer {
     });
   }
 
+  private waitForAutomaticPairing(signal: AbortSignal): Promise<void> {
+    if (this.paired) return Promise.resolve();
+    if (signal.aborted) return Promise.reject(new Error("Task cancelled."));
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        this.pairingWaiters.delete(onPaired);
+      };
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      };
+      const onPaired = (error?: Error) => finish(error);
+      const onAbort = () => finish(new Error("Task cancelled."));
+      const timer = setTimeout(
+        () =>
+          finish(
+            new Error(
+              "Auto connect is enabled, but the browser extension did not pair within 30 seconds. Make sure it is enabled and reload it on chrome://extensions.",
+            ),
+          ),
+        30_000,
+      );
+      this.pairingWaiters.add(onPaired);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (this.paired) onPaired();
+    });
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     response.setHeader("Cache-Control", "no-store");
     const origin = request.headers.origin;
@@ -221,6 +269,11 @@ export class BridgeServer {
         typeof input === "object" && input !== null && "code" in input && typeof input.code === "string"
           ? input.code
           : "";
+      const extensionOrigin = this.getExtensionOrigin(origin);
+      if (!extensionOrigin) {
+        this.send(response, 403, { error: "Pairing requests must come from the browser extension." });
+        return;
+      }
       this.pairingAttempts += 1;
       if (this.pairingAttempts > 5 || this.paired || code !== this.pairingCode) {
         if (this.pairingAttempts >= 5) this.pairingCode = "";
@@ -228,8 +281,31 @@ export class BridgeServer {
         return;
       }
       this.paired = true;
+      this.pairedExtensionOrigin = extensionOrigin;
       this.pairingCode = "";
-      for (const listener of this.pairListeners) listener(this.token);
+      for (const listener of this.pairListeners) listener(this.token, extensionOrigin);
+      for (const waiter of this.pairingWaiters) waiter();
+      this.send(response, 200, { token: this.token });
+      return;
+    }
+    if (pathname === "/auto-pair" && request.method === "POST") {
+      const extensionOrigin = this.getExtensionOrigin(origin);
+      if (!extensionOrigin) {
+        this.send(response, 403, { error: "Automatic pairing is only available to the browser extension." });
+        return;
+      }
+      if (!this.getAutoConnect()) {
+        this.send(response, 403, { error: "Enable Auto connect in the VS Code chat to pair automatically." });
+        return;
+      }
+      if (!this.paired || !this.pairedExtensionOrigin) {
+        this.send(response, 403, { error: "Use the one-time pairing code for the initial browser connection." });
+        return;
+      }
+      if (this.pairedExtensionOrigin !== extensionOrigin) {
+        this.send(response, 403, { error: "This VS Code bridge is already paired with another browser extension." });
+        return;
+      }
       this.send(response, 200, { token: this.token });
       return;
     }
@@ -240,7 +316,13 @@ export class BridgeServer {
       } catch {
         chatUrl = undefined;
       }
-      this.send(response, 200, { ok: true, paired: this.paired, browserActive: this.browserActive, chatUrl });
+      this.send(response, 200, {
+        ok: true,
+        paired: this.paired,
+        browserActive: this.browserActive,
+        autoConnect: this.getAutoConnect(),
+        chatUrl,
+      });
       return;
     }
     if (!this.authorized(request)) {
@@ -411,6 +493,10 @@ export class BridgeServer {
   }
 
   startNewConversation(): Promise<void> {
+    if (!this.paired && this.getAutoConnect()) {
+      const controller = new AbortController();
+      return this.waitForAutomaticPairing(controller.signal).then(() => this.startNewConversation());
+    }
     if (!this.paired)
       return Promise.reject(new Error("Pair the browser extension before opening a new DeepSeek conversation."));
     if (this.newConversationForNextTask || this.pendingNewConversations.size)
@@ -434,6 +520,27 @@ export class BridgeServer {
     const supplied = Buffer.from(authorization.slice(7));
     const expected = Buffer.from(this.token);
     return supplied.length === expected.length && timingSafeEqual(supplied, expected) && this.paired;
+  }
+
+  private getExtensionOrigin(origin: string | undefined): string | undefined {
+    if (!origin) return undefined;
+    try {
+      const parsed = new URL(origin);
+      if (
+        parsed.protocol !== "chrome-extension:" ||
+        !/^[a-p]{32}$/.test(parsed.hostname) ||
+        parsed.username ||
+        parsed.password ||
+        parsed.port ||
+        (parsed.pathname !== "" && parsed.pathname !== "/") ||
+        parsed.search ||
+        parsed.hash
+      )
+        return undefined;
+      return `chrome-extension://${parsed.hostname}`;
+    } catch {
+      return undefined;
+    }
   }
 
   private markCancelled(id: string): void {

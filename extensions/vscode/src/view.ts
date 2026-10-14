@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
-import { DEFAULT_DEEPSEEK_CHAT_URL, validateDeepSeekChatUrl } from "@deepseek-agent/protocol";
+import { validateDeepSeekChatUrl } from "@deepseek-agent/protocol";
 import type { AgentController, AgentUi } from "./agent";
 import type { BridgeServer } from "./bridgeServer";
 import type { TaskStatus } from "./state";
@@ -50,11 +50,11 @@ export class AgentViewProvider implements vscode.WebviewViewProvider, AgentUi {
               pairingCode: this.bridge.isPaired ? undefined : this.bridge.code,
               bridgePaired: this.bridge.isPaired,
               browserActive: this.bridge.browserActive,
+              autoConnect: vscode.workspace.getConfiguration("deepseekCodeAgent").get<boolean>("autoConnect", true),
               port: vscode.workspace.getConfiguration("deepseekCodeAgent").get<number>("bridgePort", 43127),
               conversationUrl: vscode.workspace
                 .getConfiguration("deepseekCodeAgent")
-                .get<string>("conversationUrl", DEFAULT_DEEPSEEK_CHAT_URL),
-              autoConnect: vscode.workspace.getConfiguration("deepseekCodeAgent").get<boolean>("autoConnect", true),
+                .get<string>("conversationUrl", ""),
             });
             if (!this.restored && this.controller) {
               this.restored = true;

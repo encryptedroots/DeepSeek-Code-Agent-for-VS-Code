@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import { DEFAULT_DEEPSEEK_CHAT_URL } from "@deepseek-agent/protocol";
 import { AgentController } from "./agent";
 import { BridgeServer } from "./bridgeServer";
 import { AgentViewProvider } from "./view";
@@ -13,15 +12,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let autoConnect = configuration.get<boolean>("autoConnect", true);
   const storedToken = autoConnect ? await context.secrets.get("bridgeToken") : undefined;
   const pairedToken = storedToken && /^[0-9a-f]{64}$/i.test(storedToken) ? storedToken : undefined;
-  if ((storedToken && !pairedToken) || !autoConnect) await context.secrets.delete("bridgeToken");
-  const getChatUrl = () =>
-    vscode.workspace.getConfiguration("deepseekCodeAgent").get<string>("conversationUrl", DEFAULT_DEEPSEEK_CHAT_URL);
-  bridge = new BridgeServer(port, getChatUrl, pairedToken, async (url) => {
-    await vscode.workspace
-      .getConfiguration("deepseekCodeAgent")
-      .update("conversationUrl", url, vscode.ConfigurationTarget.Global);
-    view?.conversationUrlUpdated(url);
-  });
+  const storedOrigin = autoConnect ? context.globalState.get<string>("bridgeExtensionOrigin") : undefined;
+  const pairedOrigin = storedOrigin && /^chrome-extension:\/\/[a-p]{32}$/.test(storedOrigin) ? storedOrigin : undefined;
+  const pairingVersion = context.globalState.get<number>("bridgePairingVersion", 0);
+  const hasValidPairing = pairedToken !== undefined && pairedOrigin !== undefined && pairingVersion === 1;
+  if ((storedToken && !hasValidPairing) || !autoConnect) {
+    await context.secrets.delete("bridgeToken");
+    await context.globalState.update("bridgeExtensionOrigin", undefined);
+  }
+  const getChatUrl = () => vscode.workspace.getConfiguration("deepseekCodeAgent").get<string>("conversationUrl", "");
+  const getAutoConnect = () => vscode.workspace.getConfiguration("deepseekCodeAgent").get<boolean>("autoConnect", true);
+  bridge = new BridgeServer(
+    port,
+    getChatUrl,
+    hasValidPairing ? pairedToken : undefined,
+    async (url) => {
+      await vscode.workspace
+        .getConfiguration("deepseekCodeAgent")
+        .update("conversationUrl", url, vscode.ConfigurationTarget.Global);
+      view?.conversationUrlUpdated(url);
+    },
+    getAutoConnect,
+    pairedOrigin,
+  );
   try {
     await bridge.start();
   } catch (error) {
@@ -55,9 +68,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("deepseekCodeAgent.clearConversation", () => view?.clearConversation()),
     vscode.commands.registerCommand("deepseekCodeAgent.newSession", () => view?.newSession()),
-    bridge.onDidPair((token) => {
+    bridge.onDidPair((token, origin) => {
       if (autoConnect)
-        void Promise.resolve(context.secrets.store("bridgeToken", token)).catch((error: unknown) => {
+        void Promise.all([
+          context.secrets.store("bridgeToken", token),
+          context.globalState.update("bridgeExtensionOrigin", origin),
+          context.globalState.update("bridgePairingVersion", 1),
+        ]).catch((error: unknown) => {
           console.error(
             "[DeepSeek Code Agent] Could not save browser reconnect credentials:",
             error instanceof Error ? error.name : "unknown error",
@@ -69,11 +86,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!event.affectsConfiguration("deepseekCodeAgent.autoConnect")) return;
       autoConnect = vscode.workspace.getConfiguration("deepseekCodeAgent").get<boolean>("autoConnect", true);
       const reconnectToken = bridge?.reconnectToken;
+      const reconnectOrigin = bridge?.reconnectOrigin;
       const update =
         autoConnect && reconnectToken
-          ? context.secrets.store("bridgeToken", reconnectToken)
-          : context.secrets.delete("bridgeToken");
-      void Promise.resolve(update).catch((error: unknown) => {
+          ? Promise.all([
+              context.secrets.store("bridgeToken", reconnectToken),
+              reconnectOrigin
+                ? context.globalState.update("bridgeExtensionOrigin", reconnectOrigin)
+                : Promise.resolve(),
+              context.globalState.update("bridgePairingVersion", 1),
+            ])
+          : Promise.all([
+              context.secrets.delete("bridgeToken"),
+              context.globalState.update("bridgeExtensionOrigin", undefined),
+            ]);
+      void update.catch((error: unknown) => {
         console.error(
           "[DeepSeek Code Agent] Could not update browser auto-connect preference:",
           error instanceof Error ? error.name : "unknown error",

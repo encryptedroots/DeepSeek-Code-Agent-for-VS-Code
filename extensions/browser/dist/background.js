@@ -97,6 +97,24 @@
     if (typeof stored.baseUrl !== "string" || typeof stored.token !== "string") return void 0;
     return { baseUrl: stored.baseUrl.replace(/\/+$/, ""), token: stored.token };
   }
+  async function pairAutomaticallyWhenEnabled(force = false) {
+    const stored = await chrome.storage.local.get(["baseUrl", "token"]);
+    if (!force && typeof stored.token === "string" && typeof stored.baseUrl === "string") return;
+    const baseUrl = typeof stored.baseUrl === "string" && stored.baseUrl.length > 0 ? stored.baseUrl.replace(/\/+$/, "") : DEFAULT_URL;
+    const health = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5e3) });
+    if (!health.ok) throw new Error(`Bridge health check failed (${health.status}).`);
+    const state = await health.json();
+    if (state.autoConnect !== true || state.paired !== true) return;
+    const response = await fetch(`${baseUrl}/auto-pair`, {
+      method: "POST",
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!response.ok) throw new Error(`Automatic pairing failed (${response.status}).`);
+    const result = await response.json();
+    if (typeof result.token !== "string" || !/^[0-9a-f]{64}$/i.test(result.token))
+      throw new Error("Automatic pairing returned an invalid bridge token.");
+    await chrome.storage.local.set({ baseUrl, token: result.token });
+  }
   async function authorizedFetch(path, init = {}) {
     const pairing = await getPairing();
     if (!pairing) throw new Error("Pair this extension with VS Code first.");
@@ -191,7 +209,13 @@
     if (running) return;
     running = true;
     try {
-      const response = await authorizedFetch("/next");
+      await pairAutomaticallyWhenEnabled();
+      let response = await authorizedFetch("/next");
+      if (response.status === 401) {
+        await chrome.storage.local.remove("token");
+        await pairAutomaticallyWhenEnabled(true);
+        response = await authorizedFetch("/next");
+      }
       retryDelayMs = 1e3;
       if (response.status === 204) return;
       if (!response.ok) throw new Error(`Bridge request failed (${response.status}).`);
@@ -277,6 +301,8 @@
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "bridge-poll") void poll();
   });
+  chrome.runtime.onStartup.addListener(() => void poll());
+  chrome.runtime.onInstalled.addListener(() => void poll());
   chrome.tabs.onRemoved.addListener((tabId) => {
     if (activeJob?.tabId === tabId) failActiveJob("The authenticated DeepSeek chat tab was closed.");
   });
@@ -335,7 +361,7 @@
       return true;
     }
     if (message?.type === "health") {
-      void authorizedFetch("/health").then(async (response) => {
+      void pairAutomaticallyWhenEnabled().then(() => authorizedFetch("/health")).then(async (response) => {
         const bridgeState = await response.json();
         if (typeof bridgeState.chatUrl !== "string") {
           sendResponse({

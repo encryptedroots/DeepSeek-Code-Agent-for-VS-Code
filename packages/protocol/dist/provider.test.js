@@ -33,8 +33,8 @@ class MockProvider {
         (0, vitest_1.expect)(provider.prompts[1]).toContain("previous answer was rejected");
     });
     (0, vitest_1.it)("uses bounded correction attempts and rejects repeated invalid output without returning a partial plan", async () => {
-        const provider = new MockProvider(["{", "{", "{", "{"]);
-        await (0, vitest_1.expect)((0, index_1.requestStructuredPlan)(provider, "Task", "Context", 10_000, new AbortController().signal)).rejects.toThrow(/after 4 attempts.*Nothing was applied/);
+        const provider = new MockProvider(["{", "not json", "[", "still not json"]);
+        await (0, vitest_1.expect)((0, index_1.requestStructuredPlan)(provider, "Task", "Context", 10_000, new AbortController().signal)).rejects.toThrow(/after 4 attempt\(s\).*Nothing was applied/);
         (0, vitest_1.expect)(provider.prompts).toHaveLength(4);
         (0, vitest_1.expect)(provider.prompts[1]).toContain("Escape quotes, backslashes, and line breaks");
     });
@@ -47,6 +47,38 @@ class MockProvider {
         const result = await (0, index_1.requestStructuredPlan)(provider, "Task", "Context", 10_000, new AbortController().signal);
         (0, vitest_1.expect)(result.summary).toBe("Created the module");
         (0, vitest_1.expect)(provider.prompts).toHaveLength(3);
+    });
+    (0, vitest_1.it)("accepts detailed read-only overview summaries above the former 4000-character limit", async () => {
+        const longSummary = "Project source overview. ".repeat(250);
+        (0, vitest_1.expect)(longSummary.length).toBeGreaterThan(4_000);
+        const provider = new MockProvider([
+            JSON.stringify({
+                version: 1,
+                plan: "Read source files",
+                operations: [],
+                commands: [],
+                verification: [],
+                summary: longSummary,
+            }),
+        ]);
+        const result = await (0, index_1.requestStructuredPlan)(provider, "Read-only source overview", "Source file contents", 20_000, new AbortController().signal);
+        (0, vitest_1.expect)(result.summary).toBe(longSummary);
+        (0, vitest_1.expect)(provider.prompts).toHaveLength(1);
+    });
+    (0, vitest_1.it)("stops immediately when DeepSeek repeats the same invalid response", async () => {
+        const repeatedResponse = JSON.stringify({
+            version: 1,
+            plan: "Read files",
+            operations: [],
+            commands: [],
+            verification: [],
+            summary: "x".repeat(30_001),
+        });
+        const provider = new MockProvider([repeatedResponse, repeatedResponse, validResponse]);
+        await (0, vitest_1.expect)((0, index_1.requestStructuredPlan)(provider, "Overview", "Source contents", 100_000, new AbortController().signal)).rejects.toThrow(/after 2 attempt\(s\).*repeated an identical invalid response/);
+        (0, vitest_1.expect)(provider.prompts).toHaveLength(2);
+        (0, vitest_1.expect)(provider.prompts[1]).toContain("summary is 1-30000 characters");
+        (0, vitest_1.expect)(provider.prompts[1]).toContain("summary: String must contain at most 30000 character(s)");
     });
     (0, vitest_1.it)("redacts secrets from task and context before sending to the provider", async () => {
         const provider = new MockProvider([validResponse]);

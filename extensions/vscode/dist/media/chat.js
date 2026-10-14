@@ -218,8 +218,8 @@
       connectionMode.title = connectionMode.value === "auto" ? "Reconnect automatically after the first pairing." : "Pair with the browser extension again after VS Code restarts.";
       connection.hidden = false;
       if (typeof message.pairingCode === "string") {
-        connection.textContent = `Pair the browser extension at http://127.0.0.1:${String(message.port)} using code ${message.pairingCode}. Chat readiness is checked separately.`;
-        connection.dataset.state = "disconnected";
+        connection.textContent = message.autoConnect === true ? "Auto connect is enabled. Waiting for the browser extension to pair automatically." : `Pair the browser extension at http://127.0.0.1:${String(message.port)} using code ${message.pairingCode}. Chat readiness is checked separately.`;
+        connection.dataset.state = message.autoConnect === true ? "connecting" : "disconnected";
       } else if (message.bridgePaired === true) {
         connection.textContent = message.browserActive === true ? "Browser paired and polling." : "Browser paired \xB7 waiting for the browser extension to reconnect.";
         connection.dataset.state = "paired";
@@ -263,7 +263,7 @@
     if (message.type === "paired") {
       connection.hidden = false;
       connection.dataset.state = "paired";
-      connection.textContent = "Browser extension paired and ready.";
+      connection.textContent = "Browser extension paired. DeepSeek chat readiness is checked when you send a task.";
       return;
     }
     if (message.type === "status") {

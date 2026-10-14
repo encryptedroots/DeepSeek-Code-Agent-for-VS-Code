@@ -34,6 +34,144 @@ export function taskTerms(task: string): string[] {
     .slice(0, 40);
 }
 
+export function getNewContextRequests(
+  files: string[],
+  searches: string[],
+  seenFiles: ReadonlySet<string>,
+  seenSearches: ReadonlySet<string>,
+): { files: string[]; searches: string[] } {
+  return {
+    files: [...new Set(files.filter((file) => !seenFiles.has(file)))],
+    searches: [...new Set(searches.filter((search) => !seenSearches.has(search)))],
+  };
+}
+
+export function isOverviewInventoryPath(path: string): boolean {
+  if (
+    /(?:^|\/)(?:node_modules|vendor|dist|build|out|coverage|\.git|\.svn|\.hg|\.next|\.cache|\.turbo|target|\.venv|venv|__pycache__|\.idea|\.vscode-test)(?:\/|$)/i.test(
+      path,
+    )
+  )
+    return false;
+  if (
+    /(?:^|\/)(?:\.env(?:\..*)?|.*secret.*|.*credential.*|id_rsa.*|id_ed25519.*|\.npmrc|\.pypirc|credentials)$/i.test(
+      path,
+    )
+  )
+    return false;
+  if (/(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/i.test(path))
+    return false;
+  const basename = path.split("/").pop()?.toLowerCase();
+  if (
+    basename &&
+    /^(?:dockerfile|makefile|gemfile|rakefile|procfile|justfile|\.editorconfig|\.gitignore|\.gitattributes|\.dockerignore|\.npmrc\.example)$/.test(
+      basename,
+    )
+  )
+    return true;
+  return /\.(?:c|cc|cpp|cs|css|dart|go|h|hpp|html|java|js|jsx|json|kt|md|mjs|mts|php|py|rb|rs|scss|sh|sql|swift|toml|ts|tsx|vue|svelte|astro|xml|ya?ml)$/i.test(
+    path,
+  );
+}
+
+export function buildOverviewInventoryText(
+  workspaceName: string,
+  paths: string[],
+  maxBytes: number,
+): { text: string; includedPaths: string[]; omittedCount: number } {
+  const rootCounts = new Map<string, number>();
+  for (const path of paths) {
+    const root = path.includes("/") ? path.split("/")[0] : "(root)";
+    rootCounts.set(root, (rootCounts.get(root) ?? 0) + 1);
+  }
+  const sortedRoots = [...rootCounts].sort(([left], [right]) => left.localeCompare(right));
+  let text = `Workspace: ${workspaceName}\nEligible project/source files: ${paths.length}\nProject roots:\n`;
+  const rootsLimit = Math.floor(maxBytes * 0.3);
+  const rootsStartBytes = Buffer.byteLength(text, "utf8");
+  let rootsBytes = rootsStartBytes;
+  let includedRoots = 0;
+  for (const [root, count] of sortedRoots) {
+    const line = `${root}${root === "(root)" ? "" : "/"} (${count} project/source files)\n`;
+    if (rootsBytes + Buffer.byteLength(line, "utf8") - rootsStartBytes > rootsLimit) break;
+    text += line;
+    rootsBytes += Buffer.byteLength(line, "utf8");
+    includedRoots += 1;
+  }
+  if (includedRoots < sortedRoots.length) text += `[${sortedRoots.length - includedRoots} additional roots omitted]\n`;
+  text += "\nProject/source file inventory:\n";
+  const includedPaths: string[] = [];
+  for (const path of paths) {
+    const line = `${path}\n`;
+    const omissionNotice = `\n[${paths.length - includedPaths.length - 1} additional inventory paths omitted by the context limit]`;
+    if (Buffer.byteLength(text + line + omissionNotice, "utf8") > maxBytes) break;
+    text += line;
+    includedPaths.push(path);
+  }
+  const omittedCount = paths.length - includedPaths.length;
+  if (omittedCount) text += `\n[${omittedCount} additional inventory paths omitted by the context limit]`;
+  return { text: truncateUtf8(text, maxBytes), includedPaths, omittedCount };
+}
+
+export interface OverviewSourceFile {
+  path: string;
+  content: string;
+}
+
+export interface OverviewFileBatch {
+  text: string;
+  completedPaths: string[];
+  parts: Array<{ path: string; part: number; total: number; content: string }>;
+}
+
+function splitUtf8(text: string, maxBytes: number): string[] {
+  const chunks: string[] = [];
+  let chunk = "";
+  let chunkBytes = 0;
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (chunk && chunkBytes + characterBytes > maxBytes) {
+      chunks.push(chunk);
+      chunk = "";
+      chunkBytes = 0;
+    }
+    chunk += character;
+    chunkBytes += characterBytes;
+  }
+  if (chunk || !chunks.length) chunks.push(chunk);
+  return chunks;
+}
+
+export function buildOverviewFileBatches(files: OverviewSourceFile[], maxBytes: number): OverviewFileBatch[] {
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new Error("Overview context limit must be positive.");
+  const batches: OverviewFileBatch[] = [];
+  let current = "";
+  let currentCompletedPaths: string[] = [];
+  let currentParts: OverviewFileBatch["parts"] = [];
+  for (const file of files) {
+    const headerReserve = Buffer.byteLength(`\n--- ${file.path} (part 999/999) ---\n`, "utf8");
+    const chunks = splitUtf8(file.content, Math.max(1, maxBytes - headerReserve - 1));
+    for (const [index, chunk] of chunks.entries()) {
+      const header = `\n--- ${file.path}${chunks.length > 1 ? ` (part ${index + 1}/${chunks.length})` : ""} ---\n`;
+      const section = `${header}${chunk}\n`;
+      if (Buffer.byteLength(section, "utf8") > maxBytes)
+        throw new Error(
+          `Could not fit an overview content chunk for ${file.path} within the configured context limit.`,
+        );
+      if (current && Buffer.byteLength(current + section, "utf8") > maxBytes) {
+        batches.push({ text: current, completedPaths: currentCompletedPaths, parts: currentParts });
+        current = "";
+        currentCompletedPaths = [];
+        currentParts = [];
+      }
+      current += section;
+      currentParts.push({ path: file.path, part: index + 1, total: chunks.length, content: chunk });
+      if (index === chunks.length - 1) currentCompletedPaths.push(file.path);
+    }
+  }
+  if (current) batches.push({ text: current, completedPaths: currentCompletedPaths, parts: currentParts });
+  return batches;
+}
+
 export function truncateUtf8(text: string, maxBytes: number): string {
   if (maxBytes <= 0) return "";
   const bytes = Buffer.from(text, "utf8");

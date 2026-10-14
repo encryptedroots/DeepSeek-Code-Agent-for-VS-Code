@@ -172,7 +172,6 @@ export declare function requestStructuredPlan(provider: StructuredResponseProvid
     includeProtocol?: boolean;
     onActivity?: (activity: "thinking" | "answering") => void;
 }): Promise<AgentResponse>;
-export declare const DEFAULT_DEEPSEEK_CHAT_URL = "https://chat.deepseek.com/a/chat/s/7a1408e3-2201-4f72-83f4-d17be27ff05c";
 export declare function validateDeepSeekChatUrl(input: string): string;
 export declare const bridgeJobSchema: z.ZodObject<{
     id: z.ZodString;
