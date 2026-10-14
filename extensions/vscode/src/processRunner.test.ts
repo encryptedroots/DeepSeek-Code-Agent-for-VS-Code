@@ -37,10 +37,12 @@ describe("process runner", () => {
     const directory = await mkdtemp(join(tmpdir(), "deepseek-agent-process-"));
     temporaryDirectories.push(directory);
     const pidPath = join(directory, "child.pid");
+    const readyPath = join(directory, "child-ready");
     const signalPath = join(directory, "child-stopped");
     const childCode = [
       'const fs = require("node:fs");',
       `process.on("SIGTERM", () => { fs.writeFileSync(${JSON.stringify(signalPath)}, "stopped"); process.exit(0); });`,
+      `fs.writeFileSync(${JSON.stringify(readyPath)}, "ready");`,
       "setInterval(() => {}, 1000);",
     ].join("\n");
     const parentCode = [
@@ -58,6 +60,7 @@ describe("process runner", () => {
       10_000,
     );
     const childPid = Number(await waitForFile(pidPath));
+    await waitForFile(readyPath);
     controller.abort();
     const result = await running;
     expect(result.exitCode).not.toBe(0);
