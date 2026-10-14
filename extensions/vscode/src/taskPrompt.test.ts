@@ -21,6 +21,12 @@ describe("task prompt construction", () => {
     expect(isWorkspaceOverviewRequest("Review the current project without making changes")).toBe(true);
     expect(isWorkspaceOverviewRequest("Audit this repository for quality issues")).toBe(true);
     expect(isWorkspaceOverviewRequest("Review the browser extension implementation")).toBe(true);
+    expect(isWorkspaceOverviewRequest("Review the current project but don't fix anything")).toBe(true);
+    expect(isWorkspaceOverviewRequest("Audit the repository, do not modify any files")).toBe(true);
+    expect(isWorkspaceOverviewRequest("Inspect the codebase and do not update or remove anything")).toBe(true);
+    expect(isWorkspaceOverviewRequest("Review this project without making any changes")).toBe(true);
+    expect(isWorkspaceOverviewRequest("Review the project, don't fix anything, but add a feature")).toBe(false);
+    expect(isWorkspaceOverviewRequest("Audit this codebase and then implement the fix")).toBe(false);
     expect(isWorkspaceOverviewRequest("Review the project and fix the failing tests")).toBe(false);
     expect(isWorkspaceOverviewRequest("Fix the overview panel")).toBe(false);
     expect(isWorkspaceOverviewRequest("Fix conversation URL validation")).toBe(false);

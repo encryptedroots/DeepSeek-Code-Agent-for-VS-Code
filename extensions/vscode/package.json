@@ -2,7 +2,7 @@
   "name": "deepseek-code-agent-vscode",
   "displayName": "DeepSeek Code Agent",
   "description": "A reviewed, local coding agent using your authenticated DeepSeek web session.",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "publisher": "deepseek-code-agent",
   "engines": {
     "vscode": "^1.97.0"
