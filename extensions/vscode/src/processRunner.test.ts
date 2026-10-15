@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runProcess } from "./processRunner";
+import { resolveExecutable, runProcess } from "./processRunner";
 
 const temporaryDirectories: string[] = [];
 
@@ -23,6 +23,26 @@ async function waitForFile(path: string): Promise<string> {
 }
 
 describe("process runner", () => {
+  it("uses the Windows Python launcher instead of the Store alias when available", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "deepseek-agent-python-"));
+    temporaryDirectories.push(directory);
+    const launcher = join(directory, "py.exe");
+    await writeFile(launcher, "");
+
+    expect(resolveExecutable({ executable: "python", args: ["fix.py"] }, "win32", directory)).toEqual({
+      executable: launcher,
+      args: ["-3", "fix.py"],
+    });
+    expect(resolveExecutable({ executable: "C:\\Python\\python.exe", args: ["fix.py"] }, "win32", directory)).toEqual({
+      executable: "C:\\Python\\python.exe",
+      args: ["fix.py"],
+    });
+    expect(resolveExecutable({ executable: "python", args: ["fix.py"] }, "win32", "")).toEqual({
+      executable: "python",
+      args: ["fix.py"],
+    });
+  });
+
   it("captures command output and exit status", async () => {
     const result = await runProcess(
       { executable: process.execPath, args: ["-e", 'process.stdout.write("ok"); process.stderr.write("warn")'] },

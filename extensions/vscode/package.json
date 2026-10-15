@@ -2,7 +2,7 @@
   "name": "deepseek-code-agent-vscode",
   "displayName": "DeepSeek Code Agent",
   "description": "A reviewed, local coding agent using your authenticated DeepSeek web session.",
-  "version": "0.1.23",
+  "version": "0.1.34",
   "publisher": "deepseek-code-agent",
   "engines": {
     "vscode": "^1.97.0"
@@ -55,6 +55,20 @@
           "type": "string",
           "default": "",
           "description": "HTTPS conversation URL on chat.deepseek.com used by the paired browser extension. Set this before sending a task."
+        },
+        "deepseekCodeAgent.responseMode": {
+          "type": "string",
+          "enum": [
+            "python",
+            "structured"
+          ],
+          "default": "python",
+          "description": "Show DeepSeek replies verbatim and use an approved workspace-root fix.py script for coding tasks, or use the structured file-operation protocol. Workspace overviews remain read-only in either mode."
+        },
+        "deepseekCodeAgent.pythonInterpreter": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to run the approved workspace-root fix.py script. On Windows, the Python launcher is used instead of the Microsoft Store alias when available. Scripts run with your normal user permissions."
         },
         "deepseekCodeAgent.autoConnect": {
           "type": "boolean",

@@ -22,6 +22,43 @@ export function isWorkspaceOverviewRequest(userPrompt: string): boolean {
   );
 }
 
+export function requiresWorkspaceContext(userPrompt: string): boolean {
+  const workspaceTerms =
+    /\b(?:workspace|project|repository|repo|codebase|source(?:\s+code)?|extension|application|app|file|directory|folder|module|package|component|class|function|method|script|bug|error|exception|stack\s+trace|traceback|diagnostic|build|terminal|bridge|pairing|auto[\s-]?connect|fix\.py)\b/i;
+  const codeTerms =
+    /\b(?:code|python|typescript|javascript|html|css|json|yaml|sql|api|database|dependency|dependencies)\b/i;
+  const changeActions =
+    /\b(?:fix|implement|create|add|edit|modify|update|refactor|rewrite|remove|delete|rename|move|change|build|run|test|install|upgrade|debug)\b/i;
+  const testTask = /\b(?:run|execute|fix|create|add|update|debug)\b.{0,50}\b(?:tests?|specs?)\b/i;
+  return (
+    workspaceTerms.test(userPrompt) ||
+    (codeTerms.test(userPrompt) && changeActions.test(userPrompt)) ||
+    testTask.test(userPrompt)
+  );
+}
+
+export function isMissingWorkspaceContextResponse(response: string): boolean {
+  const normalized = response.replace(/[’‘]/g, "'");
+  const inability = /\b(?:do not|don't|dont|cannot|can't|unable to)\b/i;
+  const resource =
+    /\b(?:access|read|inspect|view|see|open|retrieve)\b.{0,100}\b(?:workspace|file\s*system|files?|directories|folders)\b|\b(?:do not|don't|dont|cannot|can't|unable to)\s+have\b.{0,80}\b(?:workspace|file\s*system|files?|directories|folders)\b|\b(?:access|read|inspect|view|see|open|retrieve)\b.{0,100}\b[\w.-]+\.(?:txt|md|json|ya?ml|toml|ini|cfg|conf|py|ts|tsx|js|jsx|css|html|xml|sql|sh|bat|ps1)\b/i;
+  const unavailable =
+    /\b(?:file|path)\b.{0,100}\b(?:isn't|is not|doesn't exist|does not exist|not present|missing|unavailable|outside (?:the )?workspace)\b|\b(?:isn't|is not|doesn't exist|does not exist|not present|missing|unavailable)\b.{0,80}\b(?:workspace|file|path)\b/i;
+  return (
+    (inability.test(normalized) && resource.test(normalized)) ||
+    (inability.test(normalized) && unavailable.test(normalized))
+  );
+}
+
+export function isSpecificFileContentsRequest(response: string): boolean {
+  const normalized = response.replace(/[’‘]/g, "'");
+  const asksForContents =
+    /\b(?:paste|provide|share|send|supply)\b.{0,100}\b(?:contents?|text|information|details)\b|\b(?:contents?|text|information|details)\b.{0,100}\b(?:paste|provide|share|send|supply)\b/i;
+  const identifiesMissingFile =
+    /\b(?:file|path)\b.{0,100}\b(?:isn't|is not|doesn't exist|does not exist|not present|missing|unavailable|outside (?:the )?workspace)\b|\b(?:isn't|is not|doesn't exist|does not exist|not present|missing|unavailable)\b.{0,80}\b(?:workspace|file|path)\b/i;
+  return asksForContents.test(normalized) && identifiesMissingFile.test(normalized);
+}
+
 export interface PendingClarification {
   task: string;
   question: string;
@@ -51,7 +88,8 @@ export function buildClarificationFollowUpPrompt(clarification: PendingClarifica
     "Continue the user's original task using their clarification below; do not treat the clarification as a separate task.",
     `Original user task:\n${clarification.task}`,
     `Assistant's clarification question:\n${clarification.question}`,
-    `User's answer:\n${reply.trim()}`,
+    `User's answer and any supplied file contents or missing details:\n${reply.trim()}`,
+    "Treat any file contents pasted in the user's answer as the requested workspace context for this task, even if that file is not present in the workspace. Use those contents directly; do not ask for them again.",
     "Do not ask permission to inspect workspace files. If more context is needed, request specific paths using requestedFiles and propose no edits until the context is available.",
   ].join("\n\n");
 }

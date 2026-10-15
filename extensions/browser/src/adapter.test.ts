@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { detectDeepSeekActivity, isDeepSeekHost, selectLatestFinalAnswer, shouldCommitFinalAnswer } from "./adapter";
+import {
+  combineContinuedResponse,
+  detectDeepSeekActivity,
+  restoreMarkdownCodeBlocks,
+  isContinueButtonLabel,
+  isDeepSeekHost,
+  selectLatestFinalAnswer,
+  shouldCommitFinalAnswer,
+} from "./adapter";
 import {
   isConfiguredChatReady,
   isDeepSeekConversationUrl,
@@ -35,6 +43,32 @@ describe("DeepSeek adapter", () => {
     expect(shouldCommitFinalAnswer("answer", true, true, 10_000)).toBe(false);
     expect(shouldCommitFinalAnswer("answer", true, false, 3_499)).toBe(false);
     expect(shouldCommitFinalAnswer("answer", true, false, 3_500)).toBe(true);
+    expect(shouldCommitFinalAnswer("answer", true, false, 10_000, true)).toBe(false);
+  });
+
+  it("recognizes only the exact Continue control label", () => {
+    expect(isContinueButtonLabel(" Continue ")).toBe(true);
+    expect(isContinueButtonLabel("\nContinue\n")).toBe(true);
+    expect(isContinueButtonLabel("Continue generating")).toBe(false);
+    expect(isContinueButtonLabel("Continue task")).toBe(false);
+  });
+
+  it("preserves the full response when Continue adds text as a new response segment", () => {
+    expect(combineContinuedResponse("First part", "First part and the rest")).toBe("First part and the rest");
+    expect(combineContinuedResponse("First part", "second part")).toBe("First part\n\nsecond part");
+    expect(combineContinuedResponse("First part", "part")).toBe("First part");
+  });
+
+  it("restores DeepSeek rendered code blocks as labeled Markdown fences", () => {
+    expect(
+      restoreMarkdownCodeBlocks("Use this script:\n__DEEPSEEK_CODE_BLOCK_0__", [
+        {
+          marker: "__DEEPSEEK_CODE_BLOCK_0__",
+          language: "fix.py",
+          content: 'print("ready")',
+        },
+      ]),
+    ).toBe('Use this script:\n```fix.py\nprint("ready")\n```');
   });
 
   it("reports DeepSeek activity without forwarding its thinking text", () => {

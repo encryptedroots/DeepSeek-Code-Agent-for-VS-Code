@@ -21,7 +21,7 @@ interface PendingNewConversation {
 
 export class BridgeServer {
   private server: Server | undefined;
-  private readonly token: string;
+  private token: string;
   private pairingCode: string;
   private pairingAttempts = 0;
   private paired: boolean;
@@ -81,6 +81,22 @@ export class BridgeServer {
 
   get reconnectOrigin(): string | undefined {
     return this.paired ? this.pairedExtensionOrigin : undefined;
+  }
+
+  restorePairing(token: string, origin: string): void {
+    if (!/^[0-9a-f]{64}$/i.test(token) || this.getExtensionOrigin(origin) !== origin)
+      throw new Error("Saved browser pairing credentials are invalid.");
+    if (this.paired) {
+      if (this.token !== token || this.pairedExtensionOrigin !== origin)
+        throw new Error("The bridge is already paired with a different browser extension.");
+      return;
+    }
+    this.token = token;
+    this.paired = true;
+    this.pairedExtensionOrigin = origin;
+    this.pairingCode = "";
+    for (const listener of this.pairListeners) listener(this.token, origin);
+    for (const waiter of this.pairingWaiters) waiter();
   }
 
   get browserActive(): boolean {
@@ -236,10 +252,10 @@ export class BridgeServer {
         () =>
           finish(
             new Error(
-              "Auto connect is enabled, but the browser extension did not pair within 30 seconds. Make sure it is enabled and reload it on chrome://extensions.",
+              "Auto connect is enabled, but the browser extension did not reconnect within 90 seconds. Make sure it is enabled and reload it on chrome://extensions.",
             ),
           ),
-        30_000,
+        90_000,
       );
       this.pairingWaiters.add(onPaired);
       signal.addEventListener("abort", onAbort, { once: true });

@@ -4,6 +4,7 @@ import { isSafeRelativePath, redactSecrets } from "./safety";
 import {
   buildOverviewInventoryText,
   buildOverviewFileBatches,
+  findMentionedWorkspacePaths,
   isOverviewInventoryPath,
   rankWorkspacePaths,
   relevantExcerpt,
@@ -233,6 +234,7 @@ export class ContextCollector {
       2000,
     );
     const relative = allFiles.map((uri) => vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/"));
+    const suppliedFiles = [...new Set([...explicitFiles, ...findMentionedWorkspacePaths(relative, prompt)])];
     const editor = vscode.window.activeTextEditor;
     const candidatePath =
       editor?.document.uri.scheme === "file" && this.belongsToWorkspace(editor.document.uri)
@@ -240,7 +242,7 @@ export class ContextCollector {
         : undefined;
     const activePath = candidatePath && relative.includes(candidatePath) ? candidatePath : undefined;
     const ranked = rankWorkspacePaths(relative, prompt, activePath);
-    const selected = new Set([...explicitFiles.filter((path) => relative.includes(path)), ...ranked.slice(0, 14)]);
+    const selected = new Set([...suppliedFiles.filter((path) => relative.includes(path)), ...ranked.slice(0, 14)]);
     if (activePath) selected.add(activePath);
     const fingerprints = new Map<string, string>();
     const tree = truncateUtf8(ranked.slice(0, 80).join("\n"), Math.min(6_000, Math.floor(limit / 10)));
@@ -292,14 +294,14 @@ export class ContextCollector {
       string,
       "included" | "previously included" | "unavailable" | "too large" | "over budget"
     >();
-    for (const path of explicitFiles) {
+    for (const path of suppliedFiles) {
       if (!relative.includes(path)) fileRequestStatuses.set(path, "unavailable");
     }
     for (const path of selected) {
       if (!relative.includes(path)) continue;
       const uri = vscode.Uri.joinPath(this.workspace.uri, ...path.split("/"));
       const bytes = await vscode.workspace.fs.readFile(uri);
-      const isExplicit = explicitFiles.includes(path);
+      const isExplicit = suppliedFiles.includes(path);
       const content = redactSecrets(new TextDecoder("utf-8", { fatal: false }).decode(bytes));
       const isFull = isExplicit || bytes.length <= 6_000;
       const contentHash = createHash("sha256").update(content).digest("hex");
@@ -332,7 +334,7 @@ export class ContextCollector {
         if (isExplicit) fileRequestStatuses.set(path, "included");
       }
     }
-    for (const path of explicitFiles) {
+    for (const path of suppliedFiles) {
       if (!fileRequestStatuses.has(path)) fileRequestStatuses.set(path, "over budget");
     }
     return { text, files: includedFiles, fingerprints, contentHashes, fullFiles, headerHash, fileRequestStatuses };

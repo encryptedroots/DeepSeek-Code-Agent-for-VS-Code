@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import type { ParsedCommand } from "./commandSafety";
 
 export interface CommandResult {
@@ -110,8 +110,20 @@ export function runProcess(
   });
 }
 
-function resolveExecutable(command: ParsedCommand): { executable: string; args: string[] } {
-  if (process.platform === "win32" && /^(npm|npm\.cmd)$/i.test(command.executable)) {
+export function resolveExecutable(
+  command: ParsedCommand,
+  platform = process.platform,
+  pathValue = process.env.PATH ?? "",
+): { executable: string; args: string[] } {
+  if (platform === "win32" && /^python(?:\.exe)?$/i.test(command.executable)) {
+    const launcher = pathValue
+      .split(delimiter)
+      .filter(Boolean)
+      .map((directory) => join(directory, "py.exe"))
+      .find(existsSync);
+    if (launcher) return { executable: launcher, args: ["-3", ...command.args] };
+  }
+  if (platform === "win32" && /^(npm|npm\.cmd)$/i.test(command.executable)) {
     const cli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
     if (!existsSync(cli)) throw new Error("Could not locate the installed npm CLI next to Node.js.");
     return { executable: process.execPath, args: [cli, ...command.args] };

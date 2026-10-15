@@ -3,6 +3,7 @@ import {
   composeBoundedTaskContext,
   buildOverviewFileBatches,
   buildOverviewInventoryText,
+  findMentionedWorkspacePaths,
   getNewContextRequests,
   isOverviewInventoryPath,
   rankWorkspacePaths,
@@ -12,6 +13,25 @@ import {
 } from "./contextRanking";
 
 describe("task-focused context ranking", () => {
+  it("prioritizes explicitly mentioned workspace paths and unique filenames", () => {
+    const paths = ["agent-smoke-test.txt", "src/other.txt", "src/config.json", "tests/config.json"];
+    expect(findMentionedWorkspacePaths(paths, "Read agent-smoke-test.txt and report its contents.")).toEqual([
+      "agent-smoke-test.txt",
+    ]);
+    expect(findMentionedWorkspacePaths(paths, "Read src\\config.json.")).toEqual(["src/config.json"]);
+    expect(findMentionedWorkspacePaths(paths, "Read config.json.")).toEqual([]);
+  });
+
+  it("finds existing workspace files named in a request to paste their contents", () => {
+    const paths = ["agent-smoke-test.txt", "src/config.json", "tests/config.json"];
+    expect(
+      findMentionedWorkspacePaths(
+        paths,
+        "I can't access local files, so I can't read agent-smoke-test.txt. Please paste its contents.",
+      ),
+    ).toEqual(["agent-smoke-test.txt"]);
+  });
+
   it("keeps overview inventories to source/config files and excludes dependency lockfiles", () => {
     expect(isOverviewInventoryPath("src/agent.ts")).toBe(true);
     expect(isOverviewInventoryPath("package.json")).toBe(true);

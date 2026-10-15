@@ -297,6 +297,33 @@ describe("loopback browser bridge integration", () => {
     expect(response.status).toBe(204);
   });
 
+  it("restores a saved pairing when Auto connect is enabled after a manual-mode restart", async () => {
+    const token = "d".repeat(64);
+    bridge = new BridgeServer(0, undefined, undefined, undefined, () => true);
+    await bridge.start();
+    expect(bridge.isPaired).toBe(false);
+
+    bridge.restorePairing(token, EXTENSION_ORIGIN);
+    expect(bridge.isPaired).toBe(true);
+    expect(bridge.reconnectToken).toBe(token);
+    expect(bridge.reconnectOrigin).toBe(EXTENSION_ORIGIN);
+
+    const response = await fetch(`${bridge.address}/auto-pair`, {
+      method: "POST",
+      headers: { Origin: EXTENSION_ORIGIN },
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { token: string }).toEqual({ token });
+  });
+
+  it("rejects invalid saved browser pairing credentials", async () => {
+    bridge = new BridgeServer(0);
+    await bridge.start();
+    expect(() => bridge!.restorePairing("invalid", EXTENSION_ORIGIN)).toThrow(/credentials are invalid/i);
+    expect(() => bridge!.restorePairing("e".repeat(64), "https://example.com")).toThrow(/credentials are invalid/i);
+    expect(bridge.isPaired).toBe(false);
+  });
+
   it("only returns an existing automatic pairing to the same browser extension", async () => {
     const token = "b".repeat(64);
     bridge = new BridgeServer(0, undefined, token, undefined, () => true, EXTENSION_ORIGIN);

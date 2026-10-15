@@ -39,13 +39,98 @@ export function selectLatestFinalAnswer(candidates: Array<{ text: string; isThin
   );
 }
 
+export interface ExtractedCodeBlock {
+  marker: string;
+  language: string;
+  content: string;
+}
+
+export function restoreMarkdownCodeBlocks(text: string, codeBlocks: ExtractedCodeBlock[]): string {
+  return codeBlocks.reduce(
+    (result, block) => result.replace(block.marker, `\`\`\`${block.language}\n${block.content}\n\`\`\``),
+    text,
+  );
+}
+
+function codeBlockLanguage(pre: HTMLElement): string {
+  const code = pre.querySelector("code");
+  for (const node of [code, pre]) {
+    if (!node) continue;
+    const attribute = node.getAttribute("data-language") ?? node.getAttribute("lang");
+    if (attribute) return attribute.trim();
+    const match = node.className.match(/(?:^|\s)language-([\w.+-]+)/);
+    if (match) return match[1];
+  }
+
+  let current: HTMLElement | null = pre;
+  for (let depth = 0; current && depth < 3; depth += 1, current = current.parentElement) {
+    for (const sibling of current.parentElement?.children ?? []) {
+      if (sibling === current || !sibling.querySelector("button, [role='button']")) continue;
+      const label = sibling.cloneNode(true) as HTMLElement;
+      label.querySelectorAll("button, [role='button']").forEach((button) => button.remove());
+      const value = label.textContent?.trim() ?? "";
+      if (/^[\w.+-]+$/.test(value)) return value;
+    }
+  }
+  return "";
+}
+
+function extractResponseText(node: HTMLElement): string {
+  const clone = node.cloneNode(true) as HTMLElement;
+  const codeBlocks: ExtractedCodeBlock[] = [];
+  const originalPreBlocks = [...node.querySelectorAll<HTMLElement>("pre")];
+  const clonedPreBlocks = [...clone.querySelectorAll<HTMLElement>("pre")];
+
+  originalPreBlocks.forEach((pre, index) => {
+    const clonedPre = clonedPreBlocks[index];
+    if (!clonedPre) return;
+    const marker = `__DEEPSEEK_CODE_BLOCK_${index}__`;
+    const language = codeBlockLanguage(pre);
+    const content = pre.querySelector("code")?.textContent ?? pre.textContent ?? "";
+    codeBlocks.push({
+      marker,
+      language,
+      content: content.replace(/^\r?\n+|\r?\n+$/g, ""),
+    });
+
+    const parent = clonedPre.parentElement;
+    if (parent) {
+      for (const sibling of [...parent.children]) {
+        if (
+          sibling !== clonedPre &&
+          (sibling.querySelector("button, [role='button']") || /copy|download/i.test(sibling.textContent ?? ""))
+        )
+          sibling.remove();
+      }
+    }
+    clonedPre.replaceWith(document.createTextNode(marker));
+  });
+
+  clone.querySelectorAll("button, [role='button']").forEach((button) => button.remove());
+  const text = clone.innerText || clone.textContent || "";
+  return restoreMarkdownCodeBlocks(text, codeBlocks);
+}
+
+export function isContinueButtonLabel(label: string): boolean {
+  return label.trim().replace(/\s+/g, " ").toLowerCase() === "continue";
+}
+
+export function combineContinuedResponse(previous: string, current: string): string {
+  if (!current) return previous;
+  if (!previous) return current;
+  if (current.startsWith(previous)) return current;
+  if (previous.endsWith(current)) return previous;
+  return `${previous}\n\n${current}`;
+}
+
 export function shouldCommitFinalAnswer(
   text: string,
   started: boolean,
   streaming: boolean,
   stableForMs: number,
+  awaitingContinuation = false,
 ): boolean {
-  return started && Boolean(text.trim()) && !streaming && stableForMs >= 3_500;
+  return started && Boolean(text.trim()) && !streaming && !awaitingContinuation && stableForMs >= 3_500;
 }
 
 export function detectDeepSeekActivity(
@@ -119,7 +204,9 @@ export async function runDeepSeekPrompt(
     };
 
   const before = responseNodes();
-  const previousLast = selectLatestFinalAnswer(before.map((node) => ({ text: node.innerText, isThinking: false })));
+  const previousLast = selectLatestFinalAnswer(
+    before.map((node) => ({ text: extractResponseText(node), isThinking: false })),
+  );
   try {
     setInput(input, prompt);
     submit(input);
@@ -131,8 +218,13 @@ export async function runDeepSeekPrompt(
     let lastText = "";
     let stableSince = Date.now();
     let responseStarted = false;
+    let awaitingContinuation = false;
+    let continuationBase = "";
+    let lastObservedResponse = "";
+    let continuationIsSeparateSegment = false;
     let lastActivity: "thinking" | "answering" | undefined;
     let finished = false;
+    const clickedContinueButtons = new WeakSet<HTMLElement>();
     const isExpectedPage = () =>
       newConversation
         ? isDeepSeekNewConversationPage(location.href)
@@ -156,7 +248,9 @@ export async function runDeepSeekPrompt(
         return;
       }
       const nodes = responseNodes();
-      const response = selectLatestFinalAnswer(nodes.map((node) => ({ text: node.innerText, isThinking: false })));
+      const response = selectLatestFinalAnswer(
+        nodes.map((node) => ({ text: extractResponseText(node), isThinking: false })),
+      );
       const isThinking = [...document.querySelectorAll<HTMLElement>(THINKING_SELECTOR)].some(visible);
       if (response && (nodes.length > before.length || response !== previousLast)) {
         responseStarted = true;
@@ -166,9 +260,44 @@ export async function runDeepSeekPrompt(
         lastActivity = activity;
         onActivity?.(activity);
       }
-      if (response !== lastText) {
-        lastText = response;
+      if (awaitingContinuation && response && response !== lastObservedResponse) {
+        lastText = combineContinuedResponse(continuationBase, response);
+        continuationIsSeparateSegment = !response.startsWith(continuationBase);
+        lastObservedResponse = response;
+        awaitingContinuation = false;
         stableSince = Date.now();
+      } else if (continuationIsSeparateSegment && response && response !== lastObservedResponse) {
+        lastText = combineContinuedResponse(continuationBase, response);
+        lastObservedResponse = response;
+        stableSince = Date.now();
+      } else if (!continuationIsSeparateSegment && response !== lastText) {
+        lastText = response;
+        lastObservedResponse = response;
+        stableSince = Date.now();
+      }
+      if (!awaitingContinuation) {
+        const continueButton = [...document.querySelectorAll<HTMLElement>('[role="button"], button')].find(
+          (button) =>
+            visible(button) &&
+            !clickedContinueButtons.has(button) &&
+            [button.getAttribute("aria-label") ?? "", button.getAttribute("title") ?? "", button.innerText].some(
+              isContinueButtonLabel,
+            ),
+        );
+        if (continueButton) {
+          clickedContinueButtons.add(continueButton);
+          continuationBase = lastText;
+          lastObservedResponse = response;
+          continuationIsSeparateSegment = false;
+          awaitingContinuation = true;
+          stableSince = Date.now();
+          try {
+            continueButton.click();
+          } catch {
+            finish({ ok: false, error: "Could not activate DeepSeek's Continue control." });
+            return;
+          }
+        }
       }
       const streaming = [...document.querySelectorAll<HTMLElement>("button")].some((button) => {
         if (!visible(button)) return false;
@@ -176,7 +305,9 @@ export async function runDeepSeekPrompt(
           `${button.getAttribute("aria-label") ?? ""} ${button.title} ${button.textContent ?? ""}`.toLowerCase();
         return /stop|interrupt|停止/.test(label);
       });
-      if (shouldCommitFinalAnswer(lastText, responseStarted, streaming, Date.now() - stableSince)) {
+      if (
+        shouldCommitFinalAnswer(lastText, responseStarted, streaming, Date.now() - stableSince, awaitingContinuation)
+      ) {
         if (newConversation && !isDeepSeekConversationPage(location.href)) {
           finish({
             ok: false,

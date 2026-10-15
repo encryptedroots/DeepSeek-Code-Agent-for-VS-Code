@@ -28,6 +28,29 @@ const connectionMode = document.querySelector<HTMLSelectElement>("#connection-mo
 let thinkingPanel: HTMLDetailsElement | undefined;
 let lastPrompt = "";
 let pendingApprovalId: string | undefined;
+let pairingCode: string | undefined;
+let bridgePort = 43127;
+let bridgePaired = false;
+let browserActive = false;
+
+function renderConnectionStatus(): void {
+  connection.hidden = false;
+  if (pairingCode !== undefined && !bridgePaired) {
+    const autoConnect = connectionMode.value === "auto";
+    connection.textContent = autoConnect
+      ? `Auto connect restores a pairing after setup. Pair this browser once: open its extension popup and enter code ${pairingCode} at http://127.0.0.1:${String(bridgePort)}.`
+      : `Manual pairing: open the browser extension popup and enter code ${pairingCode} at http://127.0.0.1:${String(bridgePort)}.`;
+    connection.dataset.state = "disconnected";
+  } else if (bridgePaired) {
+    connection.textContent = browserActive
+      ? "Browser paired and polling."
+      : "Browser paired · waiting for the browser extension to reconnect.";
+    connection.dataset.state = "paired";
+  } else {
+    connection.textContent = "Browser extension is not paired.";
+    connection.dataset.state = "disconnected";
+  }
+}
 
 function inlineText(parent: HTMLElement, text: string): void {
   const inlineCode = /`([^`]+)`/g;
@@ -235,6 +258,10 @@ window.addEventListener("message", (event: MessageEvent) => {
   const message = event.data as Record<string, unknown>;
   if (message.type === "initialize") {
     document.querySelector("#workspace")!.textContent = String(message.workspace);
+    pairingCode = typeof message.pairingCode === "string" ? message.pairingCode : undefined;
+    bridgePort = typeof message.port === "number" ? message.port : 43127;
+    bridgePaired = message.bridgePaired === true;
+    browserActive = message.browserActive === true;
     if (typeof message.conversationUrl === "string") {
       conversationUrlInput.value = message.conversationUrl;
       conversationUrlState.textContent = "Using this conversation for new tasks.";
@@ -245,23 +272,7 @@ window.addEventListener("message", (event: MessageEvent) => {
       connectionMode.value === "auto"
         ? "Reconnect automatically after the first pairing."
         : "Pair with the browser extension again after VS Code restarts.";
-    connection.hidden = false;
-    if (typeof message.pairingCode === "string") {
-      connection.textContent =
-        message.autoConnect === true
-          ? "Auto connect is enabled. Waiting for the browser extension to pair automatically."
-          : `Pair the browser extension at http://127.0.0.1:${String(message.port)} using code ${message.pairingCode}. Chat readiness is checked separately.`;
-      connection.dataset.state = message.autoConnect === true ? "connecting" : "disconnected";
-    } else if (message.bridgePaired === true) {
-      connection.textContent =
-        message.browserActive === true
-          ? "Browser paired and polling."
-          : "Browser paired · waiting for the browser extension to reconnect.";
-      connection.dataset.state = "paired";
-    } else {
-      connection.textContent = "Browser extension is not paired.";
-      connection.dataset.state = "disconnected";
-    }
+    renderConnectionStatus();
     return;
   }
   if (message.type === "conversation-url-saved") {
@@ -296,12 +307,14 @@ window.addEventListener("message", (event: MessageEvent) => {
       status.textContent = connectionMode.title;
       status.dataset.state = "failed";
     }
+    renderConnectionStatus();
     return;
   }
   if (message.type === "paired") {
-    connection.hidden = false;
-    connection.dataset.state = "paired";
-    connection.textContent = "Browser extension paired. DeepSeek chat readiness is checked when you send a task.";
+    bridgePaired = true;
+    browserActive = message.browserActive === true;
+    pairingCode = undefined;
+    renderConnectionStatus();
     return;
   }
   if (message.type === "status") {

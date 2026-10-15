@@ -2,9 +2,13 @@ import * as vscode from "vscode";
 import { createHash, randomUUID } from "node:crypto";
 import { extname } from "node:path";
 import {
+  isStandaloneClarification,
+  parsePythonAgentResponse,
+  pythonProtocolInstructions,
   requestStructuredPlan,
   type AgentResponse,
   type FileOperation,
+  type PythonAgentResponse,
   type StructuredResponseProvider,
 } from "@deepseek-agent/protocol";
 import {
@@ -25,8 +29,10 @@ import { runProcess, type CommandResult } from "./processRunner";
 import {
   buildClarificationFollowUpPrompt,
   buildTaskPrompt,
-  isClarificationConfirmation,
   isClarificationRejection,
+  isMissingWorkspaceContextResponse,
+  isSpecificFileContentsRequest,
+  requiresWorkspaceContext,
   isWorkspaceOverviewRequest,
   type PendingClarification,
 } from "./taskPrompt";
@@ -171,10 +177,7 @@ export class AgentController {
         this.transition("completed", "Completed");
         return;
       }
-      const taskPrompt =
-        pendingClarification && isClarificationConfirmation(prompt)
-          ? buildClarificationFollowUpPrompt(pendingClarification, prompt)
-          : prompt;
+      const taskPrompt = pendingClarification ? buildClarificationFollowUpPrompt(pendingClarification, prompt) : prompt;
       await this.extensionContext.workspaceState.update("pendingClarification", undefined);
       if (this.viewingPastSession) {
         this.viewingPastSession = false;
@@ -292,7 +295,13 @@ export class AgentController {
     const contextLimit = configuration.get<number>("contextLimitBytes", 80_000);
     const collector = new ContextCollector(this.workspace);
     const boundedTaskPrompt = redactSecrets(buildTaskPrompt(userPrompt));
-    if (isWorkspaceOverviewRequest(userPrompt)) {
+    const isOverviewRequest = isWorkspaceOverviewRequest(userPrompt);
+    const responseMode = configuration.get<"python" | "structured">("responseMode", "python");
+    if (!isOverviewRequest && !requiresWorkspaceContext(userPrompt)) {
+      await this.runPlainConversation(userPrompt, signal, responseLimit);
+      return;
+    }
+    if (isOverviewRequest && responseMode === "structured") {
       await this.runReadOnlyOverview(
         redactSecrets(userPrompt),
         signal,
@@ -301,6 +310,21 @@ export class AgentController {
         responseLimit,
         maxIterations,
       );
+      return;
+    }
+    if (responseMode === "python") {
+      if (isOverviewRequest) {
+        await this.runPlainReadOnlyOverview(
+          redactSecrets(userPrompt),
+          signal,
+          collector,
+          contextLimit,
+          responseLimit,
+          maxIterations,
+        );
+      } else {
+        await this.runPythonTask(boundedTaskPrompt, signal, approvalMode, maxIterations, responseLimit, contextLimit);
+      }
       return;
     }
     const recentChanges = this.extensionContext.workspaceState.get<string[]>("recentAgentChanges", []);
@@ -387,14 +411,7 @@ export class AgentController {
       }
       responseSignatures.add(signature);
 
-      if (response.clarification) {
-        if (
-          response.operations.length ||
-          response.commands.length ||
-          response.requestedFiles?.length ||
-          response.searches?.length
-        )
-          throw new Error("A clarification response cannot also request context or propose changes.");
+      if (response.clarification && isStandaloneClarification(response)) {
         this.transition("clarification", "Waiting for your clarification");
         const reply = response.clarification.trim();
         this.ui.append("assistant", reply);
@@ -406,8 +423,14 @@ export class AgentController {
         return;
       }
 
+      if (
+        response.clarification &&
+        (response.operations.length || response.commands.length || response.verification.length)
+      )
+        throw new Error("A clarification response cannot also propose changes or verification commands.");
+
       if (response.requestedFiles?.length || response.searches?.length) {
-        if (response.operations.length || response.commands.length)
+        if (response.operations.length || response.commands.length || response.verification.length)
           throw new Error("A response cannot request more context and propose changes in the same step.");
         const newRequests = getNewContextRequests(
           response.requestedFiles ?? [],
@@ -518,6 +541,423 @@ export class AgentController {
     throw new Error(
       `The task reached the configured limit of ${maxIterations} iterations. Review current changes; verification may still be failing.`,
     );
+  }
+
+  private async runPlainConversation(userPrompt: string, signal: AbortSignal, responseLimit: number): Promise<void> {
+    this.transition("thinking", "Connecting to DeepSeek…");
+    const response = await this.provider.request(userPrompt, responseLimit, signal, undefined, (activity) =>
+      this.ui.activity?.(activity),
+    );
+    if (!response.trim()) throw new Error("DeepSeek returned an empty response.");
+    if (new TextEncoder().encode(response).byteLength > responseLimit)
+      throw new Error("DeepSeek response exceeded the configured size limit.");
+    this.ui.append("assistant", response);
+    await this.persist("assistant", response);
+    this.transition("completed", "Completed");
+  }
+
+  private async runPythonTask(
+    task: string,
+    signal: AbortSignal,
+    approvalMode: ApprovalMode,
+    maxIterations: number,
+    responseLimit: number,
+    contextLimit: number,
+  ): Promise<void> {
+    const configuration = vscode.workspace.getConfiguration("deepseekCodeAgent");
+    const collector = new ContextCollector(this.workspace);
+    const recentChanges = this.extensionContext.workspaceState.get<string[]>("recentAgentChanges", []);
+    const requestedFiles = new Set<string>();
+    const requestedSearches: string[] = [];
+    const seenSearches = new Set<string>();
+    const seenSearchResults = new Set<string>();
+    const seenResponses = new Set<string>();
+    const seenScripts = new Set<string>();
+    let previousContext:
+      | {
+          fileHashes: Map<string, string>;
+          fullFiles: Set<string>;
+          headerHash: string;
+        }
+      | undefined;
+    let sentSearchCount = 0;
+    let feedback = "";
+    let unresolvedExecutionFailure = "";
+    let retriedMissingContext = false;
+    let missingContextHint = "";
+
+    for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
+      this.throwIfCancelled(signal);
+      this.transition("thinking", `Thinking · iteration ${iteration} of ${maxIterations}`);
+      const context = await collector.collect(
+        missingContextHint
+          ? `${task}\n\nDeepSeek's request for additional workspace context:\n${missingContextHint}`
+          : task,
+        contextLimit,
+        [...requestedFiles],
+        recentChanges,
+        previousContext,
+      );
+      previousContext = {
+        fileHashes: context.contentHashes,
+        fullFiles: context.fullFiles,
+        headerHash: context.headerHash,
+      };
+      const newSearches = requestedSearches.slice(sentSearchCount);
+      sentSearchCount = requestedSearches.length;
+      const promptContext = composeBoundedTaskContext(
+        `${context.text}\n${newSearches.join("\n\n")}`,
+        feedback,
+        contextLimit,
+      );
+      const prompt = [
+        pythonProtocolInstructions(),
+        `\nCurrent task:\n${task}`,
+        `\nRelevant workspace context:\n${redactSecrets(promptContext)}`,
+      ].join("\n");
+      this.transition("thinking", "Connecting to DeepSeek…");
+      const rawResponse = await this.provider.request(prompt, responseLimit, signal, undefined, (activity) =>
+        this.ui.activity?.(activity),
+      );
+      if (new TextEncoder().encode(rawResponse).byteLength > responseLimit)
+        throw new Error("DeepSeek response exceeded the configured size limit.");
+      const responseHash = createHash("sha256").update(rawResponse).digest("hex");
+      if (seenResponses.has(responseHash) && !isMissingWorkspaceContextResponse(rawResponse))
+        throw new Error("DeepSeek repeated an identical response. Stopped to prevent a retry loop.");
+      seenResponses.add(responseHash);
+
+      let parsed: PythonAgentResponse;
+      try {
+        parsed = parsePythonAgentResponse(rawResponse);
+      } catch (error) {
+        feedback = `The previous response was rejected and nothing was executed: ${error instanceof Error ? error.message : "invalid response"}. Return one corrected fix.py, files, or searches block.`;
+        continue;
+      }
+
+      if (parsed.type === "message") {
+        if (!parsed.text) throw new Error("DeepSeek returned an empty response.");
+        if (isMissingWorkspaceContextResponse(parsed.text) && !unresolvedExecutionFailure) {
+          if (isSpecificFileContentsRequest(parsed.text)) {
+            this.transition("clarification", "Waiting for the requested file contents");
+            this.ui.append("assistant", rawResponse);
+            await this.persist("assistant", rawResponse);
+            await this.extensionContext.workspaceState.update("pendingClarification", {
+              task,
+              question: parsed.text,
+            } satisfies PendingClarification);
+            return;
+          }
+          if (!retriedMissingContext && iteration < maxIterations) {
+            retriedMissingContext = true;
+            missingContextHint = parsed.text;
+            previousContext = undefined;
+            feedback = [
+              "Your previous reply incorrectly claimed that you cannot access workspace files.",
+              "The local extension has checked the path(s) you mentioned against the workspace and supplies any files found below. Use those contents if they answer the task; never ask the user to paste contents of a file that is already included in the context.",
+              "If you still need context, do not stop with a plain-text refusal: return one ```files block naming exact workspace-relative paths or one ```searches block naming focused queries. If a path is unavailable, identify that exact path and ask the user for its relevant contents or the specific missing details.",
+            ].join(" ");
+            continue;
+          }
+          const clarification =
+            "Which exact workspace-relative file path(s) or specific details should I provide? Paste any relevant file contents here.";
+          this.transition("clarification", "Waiting for specific file details");
+          this.ui.append("assistant", clarification);
+          await this.persist("assistant", clarification);
+          await this.extensionContext.workspaceState.update("pendingClarification", {
+            task,
+            question: clarification,
+          } satisfies PendingClarification);
+          return;
+        }
+        this.ui.append("assistant", rawResponse);
+        await this.persist("assistant", rawResponse);
+        if (unresolvedExecutionFailure)
+          throw new Error(
+            `DeepSeek stopped without providing a corrective script after an execution or verification failure.\n${unresolvedExecutionFailure}`,
+          );
+        this.transition("completed", "Completed");
+        return;
+      }
+
+      if (parsed.type === "context") {
+        const newRequests = getNewContextRequests(parsed.files, parsed.searches, requestedFiles, seenSearches);
+        if (!newRequests.files.length && !newRequests.searches.length)
+          throw new Error("DeepSeek repeated workspace-context requests that were already fulfilled.");
+        for (const path of newRequests.files) requestedFiles.add(path);
+        for (const query of newRequests.searches) {
+          seenSearches.add(query);
+          const matches = (await collector.search(query, 20)).filter((match) => {
+            if (seenSearchResults.has(match)) return false;
+            seenSearchResults.add(match);
+            return true;
+          });
+          requestedSearches.push(`Search: ${query}\n${matches.join("\n") || "No new matches found."}`);
+        }
+        feedback = "";
+        continue;
+      }
+
+      const scriptHash = createHash("sha256").update(parsed.script).digest("hex");
+      if (seenScripts.has(scriptHash))
+        throw new Error("DeepSeek repeated an identical fix.py script. Stopped to prevent a retry loop.");
+      seenScripts.add(scriptHash);
+      this.ui.append("assistant", rawResponse);
+      await this.persist("assistant", rawResponse);
+      const scriptPath = "fix.py";
+      const scriptUri = await collector.resolveSafePath(scriptPath);
+      let originalBytes: Uint8Array | undefined;
+      try {
+        const stat = await vscode.workspace.fs.stat(scriptUri);
+        if ((stat.type & vscode.FileType.Directory) !== 0)
+          throw new Error("The workspace-root fix.py path is a directory.");
+        originalBytes = await vscode.workspace.fs.readFile(scriptUri);
+      } catch (error) {
+        if (!(error instanceof vscode.FileSystemError) || error.code !== "FileNotFound") throw error;
+      }
+      if (originalBytes && originalBytes.length > 1_000_000)
+        throw new Error("The existing workspace fix.py is larger than the 1 MB edit limit.");
+      const originalDocument = originalBytes ? await vscode.workspace.openTextDocument(scriptUri) : undefined;
+      if (originalDocument?.isDirty)
+        throw new Error("Save the existing workspace fix.py before asking DeepSeek to replace it.");
+      const before = originalDocument?.getText() ?? "";
+      if (before.includes("\0")) throw new Error("The existing workspace fix.py is not a text file.");
+      const operation: FileOperation = originalBytes
+        ? { type: "replace", path: scriptPath, edits: [] }
+        : { type: "create", path: scriptPath, content: parsed.script };
+      const stagedScript: StagedChange = {
+        operation,
+        uri: scriptUri,
+        before,
+        after: parsed.script,
+        originalBytes,
+        diskHash: originalBytes ? createHash("sha256").update(originalBytes).digest("hex") : undefined,
+        originalDocument,
+      };
+      const plan = (parsed.plan || "Review and run the proposed Python script.").slice(0, 4_000);
+      await this.previewAndApprove([stagedScript], "Review workspace-root fix.py", false);
+      const configuredCommands = configuration.get<string[]>("verificationCommands", []);
+      this.ui.approach?.(plan);
+      this.ui.proposal(plan, [`Replace workspace-root ${scriptPath}`], configuredCommands, [
+        "Python script exits successfully",
+        ...configuredCommands,
+      ]);
+      this.transition("waiting", "Waiting for approval · review the fix.py diff before applying and running");
+      const approved =
+        (await this.ui.requestApproval?.(
+          "Replace and run fix.py?",
+          `This replaces or creates only ${scriptUri.fsPath}, then runs it with your normal user permissions. Python is not sandboxed; code in the script can still read or modify other files and run commands. Review the diff and script before approving. This approval is required in every mode.`,
+          "Replace and run fix.py",
+          signal,
+        )) ?? false;
+      this.throwIfCancelled(signal);
+      if (!approved) throw new Error("Task cancelled by user before replacing and running fix.py.");
+      if (stagedScript.diskHash) {
+        const currentBytes = await vscode.workspace.fs.readFile(scriptUri);
+        if (createHash("sha256").update(currentBytes).digest("hex") !== stagedScript.diskHash)
+          throw new Error("Workspace fix.py changed after the diff was shown. No proposed script was applied.");
+        await this.backup(stagedScript);
+      } else {
+        try {
+          await vscode.workspace.fs.stat(scriptUri);
+          throw new Error("Workspace fix.py appeared after the diff was shown. No proposed script was applied.");
+        } catch (error) {
+          if (!(error instanceof vscode.FileSystemError) || error.code !== "FileNotFound") throw error;
+        }
+      }
+      await this.applyChanges([stagedScript], signal, "review");
+      const savedScript = await vscode.workspace.openTextDocument(scriptUri);
+      await vscode.window.showTextDocument(savedScript, { preview: false });
+
+      const interpreter = configuration.get<string>("pythonInterpreter", "python").trim();
+      if (!interpreter) throw new Error("Set deepseekCodeAgent.pythonInterpreter to a Python executable.");
+      this.transition("testing", `Running approved Python script with ${interpreter}…`);
+      const result = await runProcess(
+        { executable: interpreter, args: [scriptPath] },
+        this.workspace.uri.fsPath,
+        signal,
+        configuration.get<number>("commandTimeoutSeconds", 120) * 1000,
+      );
+      const scriptOutput = redactSecrets(
+        `Python script: ${scriptUri.fsPath}\nExit: ${result.exitCode === null ? "terminated" : result.exitCode}${result.timedOut ? " (timed out)" : ""}\n${result.stdout}\n${result.stderr}`,
+      ).slice(-24_000);
+
+      if (result.exitCode !== 0 || result.timedOut) {
+        unresolvedExecutionFailure = scriptOutput;
+        feedback = `The previous approved Python script failed. Correct the issue; do not repeat the same script.\n${scriptOutput}`;
+        this.transition("thinking", "Python script failed · asking DeepSeek to diagnose");
+        continue;
+      }
+
+      const verificationResults: CommandResult[] = [];
+      for (const command of configuredCommands) {
+        this.throwIfCancelled(signal);
+        const verification = await this.approveAndRun(command, signal, approvalMode);
+        if (!verification) throw new Error("Task cancelled before running a verification command.");
+        verificationResults.push(verification);
+      }
+      const failedVerification = verificationResults.filter((item) => item.exitCode !== 0 || item.timedOut);
+      if (failedVerification.length) {
+        feedback = [
+          "The Python script exited successfully, but verification failed. Fix the failures without repeating the same script.",
+          ...verificationResults.map(
+            (item) =>
+              `$ ${item.command}\nExit: ${item.exitCode === null ? "terminated" : item.exitCode}${item.timedOut ? " (timed out)" : ""}\n${redactSecrets(item.stdout)}\n${redactSecrets(item.stderr)}`,
+          ),
+        ].join("\n\n");
+        unresolvedExecutionFailure = feedback;
+        this.transition("thinking", "Verification failed · asking DeepSeek to diagnose");
+        continue;
+      }
+
+      unresolvedExecutionFailure = "";
+      const verification =
+        verificationResults.length > 0
+          ? `\n\nVerification passed:\n${verificationResults.map((item) => `- ${item.command} (exit ${item.exitCode})`).join("\n")}`
+          : "\n\nNo separate verification commands were configured.";
+      const summary = `fix.py completed successfully.${result.stdout ? `\n\n${redactSecrets(result.stdout).slice(-6_000)}` : ""}${result.stderr ? `\n\n${redactSecrets(result.stderr).slice(-2_000)}` : ""}${verification}`;
+      this.ui.append("assistant", summary);
+      await this.persist("assistant", summary);
+      this.transition(
+        "completed",
+        verificationResults.length ? "Completed · verification passed" : "Completed · Python script succeeded",
+      );
+      return;
+    }
+    throw new Error(
+      `The task reached the configured limit of ${maxIterations} iterations. Review any workspace changes; the Python script may have partially completed.`,
+    );
+  }
+
+  private async runPlainReadOnlyOverview(
+    task: string,
+    signal: AbortSignal,
+    collector: ContextCollector,
+    contextLimit: number,
+    responseLimit: number,
+    maxIterations: number,
+  ): Promise<void> {
+    this.transition("thinking", "Mapping project roots and source file inventory…");
+    const inventory = await collector.collectOverviewInventory(contextLimit);
+    const requestedPaths = new Set<string>();
+    const requestedSearches = new Set<string>();
+    const seenSearchResults = new Set<string>();
+    const inspectedPaths = new Set<string>();
+    const unavailablePaths = new Set<string>();
+    const tooLargePaths = new Set<string>();
+    const overBudgetPaths = new Set<string>();
+    const invalidRequestPaths = new Set<string>();
+    let remainingReadBudget = 300_000;
+    let responseContext = inventory.text;
+    let finalResponse: string | undefined;
+    const promptFor = (continuation: string) =>
+      [
+        pythonProtocolInstructions(),
+        "This is a strictly read-only workspace review. Never return a fix.py block, propose edits, or run commands. You choose which exact paths from the supplied inventory to inspect, and may request more files or searches using the files/searches blocks. When ready, return your user-facing answer as plain text; it will be shown in VS Code as-is.",
+        `Original user request:\n${task}`,
+        `Current scan coverage:\n${overviewCoverage(inventory, inspectedPaths, unavailablePaths, tooLargePaths, overBudgetPaths)}`,
+        `Current workspace evidence and delivery status:\n${responseContext}`,
+        continuation,
+      ].join("\n\n");
+    const request = async (continuation: string): Promise<Exclude<PythonAgentResponse, { type: "script" }>> => {
+      const response = await this.provider.request(
+        promptFor(continuation),
+        responseLimit,
+        signal,
+        undefined,
+        (activity) => this.ui.activity?.(activity),
+      );
+      if (new TextEncoder().encode(response).byteLength > responseLimit)
+        throw new Error("DeepSeek response exceeded the configured size limit.");
+      const parsed = parsePythonAgentResponse(response);
+      if (parsed.type === "script")
+        throw new Error("DeepSeek proposed executable code during a read-only review. Nothing was changed or run.");
+      return parsed;
+    };
+
+    for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
+      this.throwIfCancelled(signal);
+      this.transition("thinking", `Reviewing project · stage ${iteration} of ${maxIterations}`);
+      const response = await request(
+        "Inspect the supplied bounded inventory and request only the exact evidence you need. Do not ask permission to read workspace files. For a broad overview, focus on purpose and architecture; for a named component, focus on its implementation. If you have enough evidence, answer in plain text now.",
+      );
+      if (response.type === "message") {
+        if (!response.text.trim()) throw new Error("DeepSeek returned an empty read-only review.");
+        finalResponse = response.text;
+        break;
+      }
+
+      const newRequests = getNewContextRequests(response.files, response.searches, requestedPaths, requestedSearches);
+      for (const path of response.files) {
+        if (!inventory.listedPaths.includes(path)) invalidRequestPaths.add(path);
+      }
+      const newPaths = newRequests.files.filter((path) => inventory.listedPaths.includes(path));
+      for (const path of newPaths) requestedPaths.add(path);
+      for (const search of newRequests.searches) requestedSearches.add(search);
+      if (!newPaths.length && !newRequests.searches.length) {
+        responseContext = [
+          "All requested files were repeated or outside the supplied inventory; all requested searches were already completed.",
+          `Ignored out-of-inventory paths: ${[...invalidRequestPaths].slice(0, 10).join(", ") || "none"}.`,
+          `Coverage:\n${overviewCoverage(inventory, inspectedPaths, unavailablePaths, tooLargePaths, overBudgetPaths)}`,
+        ].join("\n\n");
+        continue;
+      }
+
+      const searchResults: string[] = [];
+      for (const query of newRequests.searches) {
+        const matches = (await collector.search(query, 20)).filter((match) => {
+          if (seenSearchResults.has(match)) return false;
+          seenSearchResults.add(match);
+          return true;
+        });
+        searchResults.push(`Search: ${query}\n${matches.join("\n") || "No new matches found."}`);
+      }
+
+      const fileBatches: string[] = [];
+      for (let offset = 0; offset < newPaths.length; offset += 10) {
+        this.throwIfCancelled(signal);
+        const files = await collector.collectOverviewFiles(
+          newPaths.slice(offset, offset + 10),
+          contextLimit,
+          signal,
+          10,
+          remainingReadBudget,
+        );
+        remainingReadBudget = Math.max(0, remainingReadBudget - files.bytesRead);
+        files.unavailablePaths.forEach((path) => unavailablePaths.add(path));
+        files.tooLargePaths.forEach((path) => tooLargePaths.add(path));
+        files.overBudgetPaths.forEach((path) => overBudgetPaths.add(path));
+        await this.sendOverviewFileBatches(
+          files,
+          `DeepSeek-selected project files · group ${Math.floor(offset / 10) + 1}`,
+          signal,
+          (path) => inspectedPaths.add(path),
+        );
+        fileBatches.push(overviewFileStatus(files));
+      }
+      responseContext = [
+        ...searchResults,
+        fileBatches.length ? `Latest file delivery status: ${fileBatches.join("; ")}` : "",
+        `Coverage:\n${overviewCoverage(inventory, inspectedPaths, unavailablePaths, tooLargePaths, overBudgetPaths)}`,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+
+    if (!finalResponse) {
+      this.throwIfCancelled(signal);
+      this.transition("thinking", "Finishing read-only review with evidence gathered so far…");
+      const response = await request(
+        "The scan reached its stage limit. Do not request more files or searches. Give the best concise answer supported by the supplied evidence, and state any remaining uncertainty in plain text.",
+      );
+      if (response.type !== "message")
+        throw new Error("DeepSeek did not finish the read-only review without another context request.");
+      if (!response.text.trim()) throw new Error("DeepSeek returned an empty read-only review.");
+      finalResponse = response.text;
+    }
+
+    this.transition("completed", `Completed · read-only review · supplied ${inspectedPaths.size} file(s)`);
+    this.ui.append("assistant", finalResponse);
+    await this.persist("assistant", finalResponse);
   }
 
   private async runReadOnlyOverview(

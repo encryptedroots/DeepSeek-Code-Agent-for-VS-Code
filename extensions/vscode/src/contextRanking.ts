@@ -34,6 +34,23 @@ export function taskTerms(task: string): string[] {
     .slice(0, 40);
 }
 
+export function findMentionedWorkspacePaths(paths: string[], prompt: string): string[] {
+  const normalizedPrompt = prompt.replace(/\\/g, "/").toLowerCase();
+  const basenameCounts = new Map<string, number>();
+  for (const path of paths) {
+    const basename = path.split("/").at(-1)?.toLowerCase();
+    if (basename) basenameCounts.set(basename, (basenameCounts.get(basename) ?? 0) + 1);
+  }
+  return paths.filter((path) => {
+    const normalizedPath = path.replace(/\\/g, "/");
+    if (normalizedPrompt.includes(normalizedPath.toLowerCase())) return true;
+    const basename = normalizedPath.split("/").at(-1)?.toLowerCase();
+    if (!basename || basenameCounts.get(basename) !== 1) return false;
+    const escaped = basename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|[^\\w.-])${escaped}(?:$|[^\\w.-])`, "i").test(normalizedPrompt);
+  });
+}
+
 export function getNewContextRequests(
   files: string[],
   searches: string[],

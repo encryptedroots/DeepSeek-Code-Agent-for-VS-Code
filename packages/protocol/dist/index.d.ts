@@ -165,6 +165,19 @@ export declare const agentResponseSchema: z.ZodEffects<z.ZodObject<{
 }>;
 export type AgentResponse = z.infer<typeof agentResponseSchema>;
 export type FileOperation = AgentResponse["operations"][number];
+export declare function isStandaloneClarification(response: AgentResponse): boolean;
+export type PythonAgentResponse = {
+    type: "script";
+    plan: string;
+    script: string;
+} | {
+    type: "context";
+    files: string[];
+    searches: string[];
+} | {
+    type: "message";
+    text: string;
+};
 export interface StructuredResponseProvider {
     request(prompt: string, responseLimit: number, signal: AbortSignal, onProgress?: (partial: string) => void, onActivity?: (activity: "thinking" | "answering") => void): Promise<string>;
 }
@@ -239,4 +252,6 @@ export declare const bridgeActivitySchema: z.ZodObject<{
     activity: "thinking" | "answering";
 }>;
 export declare function parseAgentResponse(input: string): AgentResponse;
+export declare function parsePythonAgentResponse(input: string): PythonAgentResponse;
 export declare function protocolInstructions(): string;
+export declare function pythonProtocolInstructions(): string;
